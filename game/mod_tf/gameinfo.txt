@@ -1,0 +1,53 @@
+"GameInfo"
+{
+	game					"Frog Fortress 2"
+	type 					multiplayer_only
+	nomodels				1
+	nohimodel 				1
+	nocrosshair				0
+	hidden_maps
+	{
+		"test_speakers"		1
+		"test_hardware"		1
+	}
+	nodegraph 				0
+	GameData				"tf.fgd"
+	AdditionalLocalization	"tf"
+	InstancePath			"maps/instances/"
+	advcrosshair 			1
+	supportsvr				0
+	ReplayRequired 			1
+	DependsOnAppID 			440
+	FileSystem
+	{
+		SteamAppId				243750
+		SearchPaths
+		{
+			game+mod+custom_mod	"mod_tf/custom/*"
+
+			mod+mod_write		"|gameinfo_path|."
+			game+game_write		"|gameinfo_path|."
+			vgui				"|gameinfo_path|."
+			default_write_path	"|gameinfo_path|."
+			gamebin				"|gameinfo_path|bin"
+
+			game_lv				"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf\tf2_lv_dir.vpk"
+			game+mod			"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf\tf2_textures_dir.vpk"
+			game+mod			"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf\tf2_sound_vo_english_dir.vpk"
+			game+mod			"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf\tf2_sound_misc_dir.vpk"
+			game+mod+vgui		"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf\tf2_misc_dir.vpk"
+
+			game				"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\hl2\hl2_textures_dir.vpk"
+			game				"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\hl2\hl2_sound_vo_english_dir.vpk"
+			game				"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\hl2\hl2_sound_misc_dir.vpk"
+			game+vgui			"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\hl2\hl2_misc_dir.vpk"
+			platform+vgui		"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\platform\platform_misc_dir.vpk"
+
+			game				"E:\SteamLibrary\steamapps\common\Team Fortress 2\tf"
+			game				"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\hl2"
+			platform			"E:\SteamLibrary\steamapps\common\Source SDK Base 2013 Multiplayer\platform"
+
+			game+download		"mod_tf/download"
+		}
+	}
+}
