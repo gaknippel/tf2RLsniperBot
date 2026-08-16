@@ -98,9 +98,6 @@ function EndMatch()
 }
 
 
-// GetPlayerFromUserID(userid) is a native global function already
-// exposed to script (see Script_GetPlayerFromUserID in vscript_server.cpp) -
-// do not redefine it here
 
 
 scheduledEvents <- []

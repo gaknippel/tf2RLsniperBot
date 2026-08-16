@@ -2,22 +2,42 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# custom 1v1map.vmf (width=1020, length=1345 Hammer units).
-ARENA_HALF_WIDTH = 1020.0 / 2.0   # x-axis
-ARENA_HALF_LENGTH = 1345.0 / 2.0  # y-axis
+# custom 1v1map.vmf 
+ARENA_HALF_WIDTH = 1280.0 / 2.0   # x-axis
+ARENA_HALF_LENGTH = 920.0 / 2.0  # y-axis
 
 POSITION_LOW = np.array([-ARENA_HALF_WIDTH, -ARENA_HALF_LENGTH], dtype=np.float32)
 POSITION_HIGH = np.array([ARENA_HALF_WIDTH, ARENA_HALF_LENGTH], dtype=np.float32)
 
-# opposite ends of the arena along the long (length) axis, facing each other.
-SELF_SPAWN = np.array([0.0, -ARENA_HALF_LENGTH * 0.8], dtype=np.float32)
-OPPONENT_SPAWN = np.array([0.0, ARENA_HALF_LENGTH * 0.8], dtype=np.float32)
+# opposite ends of the arena along the x axis (RED/BLU spawns in 1v1map.vmf),
+# facing each other.
+SELF_SPAWN = np.array([-500.0, 0.0], dtype=np.float32)
+OPPONENT_SPAWN = np.array([500.0, 0.0], dtype=np.float32)
 SPAWN_JITTER = 40.0  # random +/- offset added to spawn position each reset
 
-SELF_SPAWN_ANGLE = 90.0    # facing +y, toward opponent
-OPPONENT_SPAWN_ANGLE = -90.0  # facing -y, toward self
+SELF_SPAWN_ANGLE = 0.0       # facing +x (RED), toward opponent
+OPPONENT_SPAWN_ANGLE = 180.0  # facing -x (BLU), toward self
 
 MAX_EPISODE_STEPS = 300
+
+# how far a full-strength (1.0) action value moves/turns an agent in one step
+MAX_MOVE_PER_STEP = 20.0   # hammer units
+MAX_TURN_PER_STEP_DEG = 15.0
+
+NOOP_ACTION = np.zeros(5, dtype=np.float32)  # placeholder opponent action
+
+FULL_CHARGE_STEPS = 30  # steps of holding scope to reach full (1.0) charge
+
+MAX_HEALTH = 125.0  # TF2 Sniper base health
+AIM_TOLERANCE_DEG = 5.0  # target must be within this many degrees of facing to be hit
+
+MIN_CHARGE_FOR_HEADSHOT = 0.1  # ~3 steps of scoping before a headshot can register
+UNSCOPED_HIT_DAMAGE = 50.0     # flat body-shot damage: unscoped, or scoped but under-charged
+MIN_HEADSHOT_DAMAGE = 150.0    # headshot damage at MIN_CHARGE_FOR_HEADSHOT
+MAX_HEADSHOT_DAMAGE = 450.0    # headshot damage at full (1.0) charge
+
+TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shaping
+SHAPING_SCALE = 0.01     # small per-step reward for being aimed at the opponent
 
 
 class SniperDuelEnv(gym.Env):
@@ -26,7 +46,7 @@ class SniperDuelEnv(gym.Env):
         self.action_space = spaces.Box(
             low=-1.0, # for movement. like an analog stick
             high=1.0,
-            shape=(5,), # 5 elements for the bot. x, y, turn, scope, fire
+            shape=(5,), # 5 elements: strafe, forward/back, turn, scope, fire (strafe/forward are relative to facing)
             dtype=np.float32,
         )
         #basically a set of rules for the ai to abide
@@ -42,6 +62,7 @@ class SniperDuelEnv(gym.Env):
             ),
             "opponent_visible": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "time_left": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            "self_health": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
 
     def reset(self, *, seed=None, options=None):
@@ -58,11 +79,109 @@ class SniperDuelEnv(gym.Env):
         self._opponent_scope_active = False
         self._opponent_scope_charge = 0.0
 
+        self._self_health = MAX_HEALTH
+        self._opponent_health = MAX_HEALTH
+
         self._step_count = 0
 
         observation = self._get_obs()
         info = {}
         return observation, info
+
+    def _move_agent(self, pos, angle, action):
+
+        yaw_rad = np.radians(angle)
+        forward = np.array([np.cos(yaw_rad), np.sin(yaw_rad)], dtype=np.float32)
+        right = np.array([np.sin(yaw_rad), -np.cos(yaw_rad)], dtype=np.float32)
+
+        strafe, fwd_back = action[0], action[1]
+        move = (strafe * right + fwd_back * forward) * MAX_MOVE_PER_STEP
+        pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
+
+        angle = angle + action[2] * MAX_TURN_PER_STEP_DEG
+        angle = ((angle + 180.0) % 360.0) - 180.0  # wrap to [-180, 180]
+
+        return pos, angle
+
+    def _update_scope(self, scope_active, scope_charge, action):
+        scoping_now = action[3] > 0.0
+
+        if scoping_now:
+            scope_charge = min(1.0, scope_charge + 1.0 / FULL_CHARGE_STEPS)
+        else:
+            scope_charge = 0.0
+
+        return scoping_now, scope_charge
+
+    def _is_on_target(self, shooter_pos, shooter_angle, target_pos):
+        to_target = target_pos - shooter_pos
+        angle_to_target = np.degrees(np.arctan2(to_target[1], to_target[0]))
+        angle_diff = ((angle_to_target - shooter_angle + 180.0) % 360.0) - 180.0
+        return abs(angle_diff) <= AIM_TOLERANCE_DEG
+
+    def _resolve_fire(self, shooter_pos, shooter_angle, shooter_scope_active, shooter_scope_charge, fire_signal, target_pos):
+        if fire_signal <= 0.0:
+            return 0.0
+        if not self._is_on_target(shooter_pos, shooter_angle, target_pos):
+            return 0.0
+
+        if shooter_scope_active and shooter_scope_charge >= MIN_CHARGE_FOR_HEADSHOT:
+            charge_t = (shooter_scope_charge - MIN_CHARGE_FOR_HEADSHOT) / (1.0 - MIN_CHARGE_FOR_HEADSHOT)
+            return MIN_HEADSHOT_DAMAGE + charge_t * (MAX_HEADSHOT_DAMAGE - MIN_HEADSHOT_DAMAGE)
+
+        return UNSCOPED_HIT_DAMAGE
+
+    def step(self, action):
+        action = np.asarray(action, dtype=np.float32)
+
+        self._self_pos, self._self_angle = self._move_agent(
+            self._self_pos, self._self_angle, action
+        )
+        self._opponent_pos, self._opponent_angle = self._move_agent(
+            self._opponent_pos, self._opponent_angle, NOOP_ACTION
+        )
+
+        self._self_scope_active, self._self_scope_charge = self._update_scope(
+            self._self_scope_active, self._self_scope_charge, action
+        )
+        self._opponent_scope_active, self._opponent_scope_charge = self._update_scope(
+            self._opponent_scope_active, self._opponent_scope_charge, NOOP_ACTION
+        )
+
+        damage_to_opponent = self._resolve_fire(
+            self._self_pos, self._self_angle,
+            self._self_scope_active, self._self_scope_charge,
+            action[4], self._opponent_pos,
+        )
+        damage_to_self = self._resolve_fire(
+            self._opponent_pos, self._opponent_angle,
+            self._opponent_scope_active, self._opponent_scope_charge,
+            NOOP_ACTION[4], self._self_pos,
+        )
+        self._opponent_health = max(0.0, self._opponent_health - damage_to_opponent)
+        self._self_health = max(0.0, self._self_health - damage_to_self)
+
+        self._step_count += 1
+
+        self_dead = self._self_health <= 0.0
+        opponent_dead = self._opponent_health <= 0.0
+
+        if self_dead and opponent_dead:
+            reward = 0.0  # simultaneous kill, draw
+        elif opponent_dead:
+            reward = TERMINAL_REWARD
+        elif self_dead:
+            reward = -TERMINAL_REWARD
+        else:
+            aimed_at_opponent = self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
+            reward = SHAPING_SCALE if aimed_at_opponent else 0.0
+
+        terminated = self_dead or opponent_dead
+        truncated = self._step_count >= MAX_EPISODE_STEPS
+        observation = self._get_obs()
+        info = {}
+
+        return observation, reward, terminated, truncated, info
 
     def _get_obs(self): #get observation. basically packaging all the data so it fits the observation rulespace
         time_left = 1.0 - (self._step_count / MAX_EPISODE_STEPS)
@@ -75,6 +194,7 @@ class SniperDuelEnv(gym.Env):
             "opponent_pos": self._opponent_pos.astype(np.float32),
             "opponent_visible": np.array([1.0], dtype=np.float32),
             "time_left": np.array([time_left], dtype=np.float32),
+            "self_health": np.array([self._self_health / MAX_HEALTH], dtype=np.float32),
         }
 
 
@@ -83,4 +203,10 @@ if __name__ == "__main__":
     obs, info = env.reset(seed=42)
     print("observation:", obs)
     print("info:", info)
+    print("valid according to observation_space?", env.observation_space.contains(obs))
+
+    print("\nself_pos before step:", env._self_pos)
+    move_right_action = np.array([1.0, 0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    obs, reward, terminated, truncated, info = env.step(move_right_action)
+    print("self_pos after step:", obs["self_pos"])
     print("valid according to observation_space?", env.observation_space.contains(obs))
