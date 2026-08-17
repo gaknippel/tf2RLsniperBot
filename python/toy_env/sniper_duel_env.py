@@ -18,6 +18,18 @@ SPAWN_JITTER = 40.0  # random +/- offset added to spawn position each reset
 SELF_SPAWN_ANGLE = 0.0       # facing +x (RED), toward opponent
 OPPONENT_SPAWN_ANGLE = 180.0  # facing -x (BLU), toward self
 
+# top-down (x,y) footprints of the cover brushes in 1v1map.vmf, as
+# (x_min, x_max, y_min, y_max). taken directly from the .vmf solids.
+BARRIERS = np.array([
+    [-476.0, -412.0, 144.667, 374.0],   # upper-left pillar
+    [-476.0, -412.0, -330.0, -100.667], # lower-left pillar
+    [-28.0, 36.0, -74.0, 118.0],        # middle crate
+    [400.0, 464.0, 141.667, 371.0],     # upper-right pillar
+    [400.0, 464.0, -333.0, -103.667],   # lower-right pillar
+], dtype=np.float32)
+
+LOS_SAMPLE_COUNT = 40  # points checked along the shooter->target line for line-of-sight
+
 MAX_EPISODE_STEPS = 300
 
 # how far a full-strength (1.0) action value moves/turns an agent in one step
@@ -96,12 +108,15 @@ class SniperDuelEnv(gym.Env):
 
         strafe, fwd_back = action[0], action[1]
         move = (strafe * right + fwd_back * forward) * MAX_MOVE_PER_STEP
-        pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
+        new_pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
+
+        if self._point_in_any_barrier(new_pos):
+            new_pos = pos  # movement blocked by cover, stay put
 
         angle = angle + action[2] * MAX_TURN_PER_STEP_DEG
         angle = ((angle + 180.0) % 360.0) - 180.0  # wrap to [-180, 180]
 
-        return pos, angle
+        return new_pos, angle
 
     def _update_scope(self, scope_active, scope_charge, action):
         scoping_now = action[3] > 0.0
@@ -113,6 +128,35 @@ class SniperDuelEnv(gym.Env):
 
         return scoping_now, scope_charge
 
+    def _point_in_barrier(self, point, barrier):
+        x, y = point
+        x_min, x_max, y_min, y_max = barrier
+
+        if x_min <= x <= x_max and y_min <= y <= y_max:
+            return True
+        else:
+            return False
+
+    def _lerp_point(self, a, b, fraction):
+        return a + fraction * (b - a)
+
+    def _point_in_any_barrier(self, point):
+        for barrier in BARRIERS:
+            if self._point_in_barrier(point, barrier):
+                return True
+
+        return False
+
+    def _line_of_sight_clear(self, shooter_pos, target_pos):
+        for i in range(LOS_SAMPLE_COUNT + 1):
+            fraction = i / LOS_SAMPLE_COUNT
+            point = self._lerp_point(shooter_pos, target_pos, fraction)
+
+            if self._point_in_any_barrier(point):
+                return False
+
+        return True
+
     def _is_on_target(self, shooter_pos, shooter_angle, target_pos):
         to_target = target_pos - shooter_pos
         angle_to_target = np.degrees(np.arctan2(to_target[1], to_target[0]))
@@ -123,6 +167,8 @@ class SniperDuelEnv(gym.Env):
         if fire_signal <= 0.0:
             return 0.0
         if not self._is_on_target(shooter_pos, shooter_angle, target_pos):
+            return 0.0
+        if not self._line_of_sight_clear(shooter_pos, target_pos):
             return 0.0
 
         if shooter_scope_active and shooter_scope_charge >= MIN_CHARGE_FOR_HEADSHOT:
@@ -185,14 +231,20 @@ class SniperDuelEnv(gym.Env):
 
     def _get_obs(self): #get observation. basically packaging all the data so it fits the observation rulespace
         time_left = 1.0 - (self._step_count / MAX_EPISODE_STEPS)
+
+        opponent_visible = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
+        if opponent_visible:
+            opponent_pos_obs = self._opponent_pos.astype(np.float32)
+        else:
+            opponent_pos_obs = np.zeros(2, dtype=np.float32)
+
         return {
             "self_pos": self._self_pos.astype(np.float32),
             "self_angle": np.array([self._self_angle], dtype=np.float32),
             "scope_active": np.array([1.0 if self._self_scope_active else 0.0], dtype=np.float32),
             "scope_charge": np.array([self._self_scope_charge], dtype=np.float32),
-            # TODO: mask position and force opponent_visible=0.0 once line-of-sight/cover exists.
-            "opponent_pos": self._opponent_pos.astype(np.float32),
-            "opponent_visible": np.array([1.0], dtype=np.float32),
+            "opponent_pos": opponent_pos_obs,
+            "opponent_visible": np.array([1.0 if opponent_visible else 0.0], dtype=np.float32),
             "time_left": np.array([time_left], dtype=np.float32),
             "self_health": np.array([self._self_health / MAX_HEALTH], dtype=np.float32),
         }
