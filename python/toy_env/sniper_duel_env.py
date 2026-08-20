@@ -55,6 +55,12 @@ SHAPING_SCALE = 0.01     # small per-step reward for being aimed at the opponent
 class SniperDuelEnv(gym.Env):
     def __init__(self):
         super().__init__()
+
+        # optional self-play opponent: anything with .predict(obs) -> (action, state),
+        # e.g. a loaded SB3 model snapshot. None means "opponent stands still" (NOOP_ACTION),
+        # which keeps reset()/step() usable standalone for manual testing and check_env.
+        self.opponent_policy = None
+
         self.action_space = spaces.Box(
             low=-1.0, # for movement. like an analog stick
             high=1.0,
@@ -180,18 +186,25 @@ class SniperDuelEnv(gym.Env):
     def step(self, action):
         action = np.asarray(action, dtype=np.float32)
 
+        if self.opponent_policy is not None:
+            opponent_obs = self._get_opponent_obs()
+            opponent_action, _ = self.opponent_policy.predict(opponent_obs, deterministic=False)
+            opponent_action = np.asarray(opponent_action, dtype=np.float32)
+        else:
+            opponent_action = NOOP_ACTION
+
         self._self_pos, self._self_angle = self._move_agent(
             self._self_pos, self._self_angle, action
         )
         self._opponent_pos, self._opponent_angle = self._move_agent(
-            self._opponent_pos, self._opponent_angle, NOOP_ACTION
+            self._opponent_pos, self._opponent_angle, opponent_action
         )
 
         self._self_scope_active, self._self_scope_charge = self._update_scope(
             self._self_scope_active, self._self_scope_charge, action
         )
         self._opponent_scope_active, self._opponent_scope_charge = self._update_scope(
-            self._opponent_scope_active, self._opponent_scope_charge, NOOP_ACTION
+            self._opponent_scope_active, self._opponent_scope_charge, opponent_action
         )
 
         damage_to_opponent = self._resolve_fire(
@@ -202,7 +215,7 @@ class SniperDuelEnv(gym.Env):
         damage_to_self = self._resolve_fire(
             self._opponent_pos, self._opponent_angle,
             self._opponent_scope_active, self._opponent_scope_charge,
-            NOOP_ACTION[4], self._self_pos,
+            opponent_action[4], self._self_pos,
         )
         self._opponent_health = max(0.0, self._opponent_health - damage_to_opponent)
         self._self_health = max(0.0, self._self_health - damage_to_self)
@@ -219,7 +232,13 @@ class SniperDuelEnv(gym.Env):
         elif self_dead:
             reward = -TERMINAL_REWARD
         else:
-            aimed_at_opponent = self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
+            # require actual LOS, not just angle -- otherwise "facing the
+            # opponent's raw bearing through a wall" farms the same reward as
+            # genuinely having them in your sights, with none of the risk.
+            aimed_at_opponent = (
+                self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
+                and self._line_of_sight_clear(self._self_pos, self._opponent_pos)
+            )
             reward = SHAPING_SCALE if aimed_at_opponent else 0.0
 
         terminated = self_dead or opponent_dead
@@ -229,25 +248,45 @@ class SniperDuelEnv(gym.Env):
 
         return observation, reward, terminated, truncated, info
 
-    def _get_obs(self): #get observation. basically packaging all the data so it fits the observation rulespace
+    def _build_obs(self, viewer_pos, viewer_angle, viewer_scope_active, viewer_scope_charge,
+                    viewer_health, other_pos):
+        # shared observation builder, viewed from whichever agent is "viewer" here.
+        # called once for the training agent (_get_obs) and once for the opponent
+        # (_get_opponent_obs), swapping which agent's state is "self" vs "opponent".
         time_left = 1.0 - (self._step_count / MAX_EPISODE_STEPS)
 
-        opponent_visible = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
-        if opponent_visible:
-            opponent_pos_obs = self._opponent_pos.astype(np.float32)
+        other_visible = self._line_of_sight_clear(viewer_pos, other_pos)
+        if other_visible:
+            other_pos_obs = other_pos.astype(np.float32)
         else:
-            opponent_pos_obs = np.zeros(2, dtype=np.float32)
+            other_pos_obs = np.zeros(2, dtype=np.float32)
 
         return {
-            "self_pos": self._self_pos.astype(np.float32),
-            "self_angle": np.array([self._self_angle], dtype=np.float32),
-            "scope_active": np.array([1.0 if self._self_scope_active else 0.0], dtype=np.float32),
-            "scope_charge": np.array([self._self_scope_charge], dtype=np.float32),
-            "opponent_pos": opponent_pos_obs,
-            "opponent_visible": np.array([1.0 if opponent_visible else 0.0], dtype=np.float32),
+            "self_pos": viewer_pos.astype(np.float32),
+            "self_angle": np.array([viewer_angle], dtype=np.float32),
+            "scope_active": np.array([1.0 if viewer_scope_active else 0.0], dtype=np.float32),
+            "scope_charge": np.array([viewer_scope_charge], dtype=np.float32),
+            "opponent_pos": other_pos_obs,
+            "opponent_visible": np.array([1.0 if other_visible else 0.0], dtype=np.float32),
             "time_left": np.array([time_left], dtype=np.float32),
-            "self_health": np.array([self._self_health / MAX_HEALTH], dtype=np.float32),
+            "self_health": np.array([viewer_health / MAX_HEALTH], dtype=np.float32),
         }
+
+    def _get_obs(self): #get observation. basically packaging all the data so it fits the observation rulespace
+        return self._build_obs(
+            self._self_pos, self._self_angle,
+            self._self_scope_active, self._self_scope_charge,
+            self._self_health, self._opponent_pos,
+        )
+
+    def _get_opponent_obs(self):
+        # same shape as _get_obs, but from the opponent's point of view, so their
+        # policy sees themselves as "self" and the training agent as "opponent".
+        return self._build_obs(
+            self._opponent_pos, self._opponent_angle,
+            self._opponent_scope_active, self._opponent_scope_charge,
+            self._opponent_health, self._self_pos,
+        )
 
 
 if __name__ == "__main__":
