@@ -16,14 +16,24 @@ OUTPUT_HEADER_PATH = os.path.join(
 )
 
 
+def format_float(v):
+    # %.9g drops the decimal point for whole numbers (e.g. -1.0 -> "-1"),
+    # which C++ then parses as an int literal with an invalid "f" suffix --
+    # force a decimal point so it's always a valid float literal.
+    s = f"{v:.9g}"
+    if "." not in s and "e" not in s and "E" not in s:
+        s += ".0"
+    return s + "f"
+
+
 def format_float_array(values, indent="\t"):
-    return indent + ", ".join(f"{v:.9g}f" for v in values)
+    return indent + ", ".join(format_float(v) for v in values)
 
 
 def format_matrix(rows, indent="\t"):
     lines = []
     for row in rows:
-        lines.append(indent + "{ " + ", ".join(f"{v:.9g}f" for v in row) + " },")
+        lines.append(indent + "{ " + ", ".join(format_float(v) for v in row) + " },")
     return "\n".join(lines)
 
 

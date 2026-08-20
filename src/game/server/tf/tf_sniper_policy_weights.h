@@ -184,11 +184,11 @@ namespace SniperPolicy
 
 	const float kActionLow[5] =
 	{
-		-1f, -1f, -1f, -1f, -1f
+		-1.0f, -1.0f, -1.0f, -1.0f, -1.0f
 	};
 	const float kActionHigh[5] =
 	{
-		1f, 1f, 1f, 1f, 1f
+		1.0f, 1.0f, 1.0f, 1.0f, 1.0f
 	};
 
 	// obs_key_order from export_policy.py, for reference when building the
