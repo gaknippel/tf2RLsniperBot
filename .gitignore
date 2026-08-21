@@ -10,6 +10,7 @@
 /python/toy_env/tb_logs/
 /python/toy_env/snapshots/
 /python/toy_env/models/
+/python/toy_env/*.log
 
 # RL bridge: hand-picked files only within the (otherwise untracked) SDK
 # source tree -- vendor/engine source stays untracked, only files we

@@ -50,6 +50,9 @@ MAX_HEADSHOT_DAMAGE = 450.0    # headshot damage at full (1.0) charge
 
 TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shaping
 SHAPING_SCALE = 0.01     # small per-step reward for being aimed at the opponent
+MISS_PENALTY = 0.02      # small per-shot cost when firing lands no damage -- discourages
+                          # constant spam-fire (the toy env has no ammo limit, so without
+                          # this a policy has zero incentive to hold fire until actually aimed)
 
 
 class SniperDuelEnv(gym.Env):
@@ -83,14 +86,43 @@ class SniperDuelEnv(gym.Env):
             "self_health": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
         })
 
+    def load_opponent(self, snapshot_path):
+        # loads a frozen opponent snapshot from disk inside whichever process
+        # this env instance lives in -- needed for SubprocVecEnv self-play,
+        # where each worker process has its own SniperDuelEnv and can't share
+        # an in-memory PPO object with the main process.
+        from stable_baselines3 import PPO
+        self.opponent_policy = PPO.load(snapshot_path)
+
     def reset(self, *, seed=None, options=None):
         super().reset(seed=seed)
 
-        self._self_pos = SELF_SPAWN + self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER, size=2)
-        self._opponent_pos = OPPONENT_SPAWN + self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER, size=2)
+        # randomize which physical spawn "self" starts at each episode. if
+        # this were fixed, the agent under active gradient optimization would
+        # only ever be trained playing from one side/angle -- the opponent
+        # role (frozen snapshots) would use the other side, but never get
+        # updated for it. confirmed empirically: a fixed-side-trained policy
+        # evaluated as a symmetric deterministic mirror match won ~500/500 as
+        # the trained side and ~0 as the other.
+        # `_mirrored` records, per agent, whether THIS episode's physical spawn
+        # needs its observations/actions reflected (x negated) to look like the
+        # canonical SELF_SPAWN-side case the network was originally shaped
+        # around -- see _build_obs/_move_agent. self and opponent are always on
+        # opposite physical sides, so exactly one of them is mirrored per episode.
+        if self.np_random.uniform() < 0.5:
+            self_spawn, opponent_spawn = SELF_SPAWN, OPPONENT_SPAWN
+            self_angle, opponent_angle = SELF_SPAWN_ANGLE, OPPONENT_SPAWN_ANGLE
+            self._self_mirrored, self._opponent_mirrored = False, True
+        else:
+            self_spawn, opponent_spawn = OPPONENT_SPAWN, SELF_SPAWN
+            self_angle, opponent_angle = OPPONENT_SPAWN_ANGLE, SELF_SPAWN_ANGLE
+            self._self_mirrored, self._opponent_mirrored = True, False
 
-        self._self_angle = SELF_SPAWN_ANGLE
-        self._opponent_angle = OPPONENT_SPAWN_ANGLE
+        self._self_pos = self_spawn + self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER, size=2)
+        self._opponent_pos = opponent_spawn + self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER, size=2)
+
+        self._self_angle = self_angle
+        self._opponent_angle = opponent_angle
 
         self._self_scope_active = False
         self._self_scope_charge = 0.0
@@ -106,20 +138,29 @@ class SniperDuelEnv(gym.Env):
         info = {}
         return observation, info
 
-    def _move_agent(self, pos, angle, action):
+    def _move_agent(self, pos, angle, action, mirrored):
+        # the network only ever "thinks" in the canonical (unmirrored) frame --
+        # for a mirrored agent, its chosen strafe/turn are canonical-frame
+        # intentions that must be reflected back into this agent's real-world
+        # frame. Mirroring the world (negating x) is a reflection, which flips
+        # chirality: canonical "turn right"/"strafe right" become real "turn
+        # left"/"strafe left" for a mirrored agent, so both need sign flips.
+        # forward/back needs no flip -- the forward vector transforms correctly
+        # under the same reflection (see the derivation in project memory).
+        mirror_sign = -1.0 if mirrored else 1.0
 
         yaw_rad = np.radians(angle)
         forward = np.array([np.cos(yaw_rad), np.sin(yaw_rad)], dtype=np.float32)
         right = np.array([np.sin(yaw_rad), -np.cos(yaw_rad)], dtype=np.float32)
 
-        strafe, fwd_back = action[0], action[1]
+        strafe, fwd_back = mirror_sign * action[0], action[1]
         move = (strafe * right + fwd_back * forward) * MAX_MOVE_PER_STEP
         new_pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
 
         if self._point_in_any_barrier(new_pos):
             new_pos = pos  # movement blocked by cover, stay put
 
-        angle = angle + action[2] * MAX_TURN_PER_STEP_DEG
+        angle = angle + mirror_sign * action[2] * MAX_TURN_PER_STEP_DEG
         angle = ((angle + 180.0) % 360.0) - 180.0  # wrap to [-180, 180]
 
         return new_pos, angle
@@ -194,10 +235,10 @@ class SniperDuelEnv(gym.Env):
             opponent_action = NOOP_ACTION
 
         self._self_pos, self._self_angle = self._move_agent(
-            self._self_pos, self._self_angle, action
+            self._self_pos, self._self_angle, action, self._self_mirrored
         )
         self._opponent_pos, self._opponent_angle = self._move_agent(
-            self._opponent_pos, self._opponent_angle, opponent_action
+            self._opponent_pos, self._opponent_angle, opponent_action, self._opponent_mirrored
         )
 
         self._self_scope_active, self._self_scope_charge = self._update_scope(
@@ -241,6 +282,11 @@ class SniperDuelEnv(gym.Env):
             )
             reward = SHAPING_SCALE if aimed_at_opponent else 0.0
 
+            # discourage constant spam-fire -- the env has no ammo limit, so
+            # without a cost the policy has no reason to ever hold fire.
+            if action[4] > 0.0 and damage_to_opponent <= 0.0:
+                reward -= MISS_PENALTY
+
         terminated = self_dead or opponent_dead
         truncated = self._step_count >= MAX_EPISODE_STEPS
         observation = self._get_obs()
@@ -249,21 +295,36 @@ class SniperDuelEnv(gym.Env):
         return observation, reward, terminated, truncated, info
 
     def _build_obs(self, viewer_pos, viewer_angle, viewer_scope_active, viewer_scope_charge,
-                    viewer_health, other_pos):
+                    viewer_health, other_pos, mirrored):
         # shared observation builder, viewed from whichever agent is "viewer" here.
         # called once for the training agent (_get_obs) and once for the opponent
         # (_get_opponent_obs), swapping which agent's state is "self" vs "opponent".
+        #
+        # `mirrored` reflects the whole world (negate x, keep y) so a viewer on
+        # either physical spawn always perceives itself in the same canonical
+        # frame -- otherwise the network has to learn two disjoint input
+        # regions from scratch (confirmed empirically to fail to converge; see
+        # project memory). _move_agent applies the matching un-mirror to this
+        # viewer's own chosen actions before touching real physics.
         time_left = 1.0 - (self._step_count / MAX_EPISODE_STEPS)
 
         other_visible = self._line_of_sight_clear(viewer_pos, other_pos)
         if other_visible:
-            other_pos_obs = other_pos.astype(np.float32)
+            other_pos_obs = other_pos.astype(np.float32).copy()
         else:
             other_pos_obs = np.zeros(2, dtype=np.float32)
 
+        viewer_pos_obs = viewer_pos.astype(np.float32).copy()
+        viewer_angle_obs = viewer_angle
+
+        if mirrored:
+            viewer_pos_obs[0] = -viewer_pos_obs[0]
+            other_pos_obs[0] = -other_pos_obs[0]
+            viewer_angle_obs = ((180.0 - viewer_angle_obs + 180.0) % 360.0) - 180.0
+
         return {
-            "self_pos": viewer_pos.astype(np.float32),
-            "self_angle": np.array([viewer_angle], dtype=np.float32),
+            "self_pos": viewer_pos_obs,
+            "self_angle": np.array([viewer_angle_obs], dtype=np.float32),
             "scope_active": np.array([1.0 if viewer_scope_active else 0.0], dtype=np.float32),
             "scope_charge": np.array([viewer_scope_charge], dtype=np.float32),
             "opponent_pos": other_pos_obs,
@@ -276,7 +337,7 @@ class SniperDuelEnv(gym.Env):
         return self._build_obs(
             self._self_pos, self._self_angle,
             self._self_scope_active, self._self_scope_charge,
-            self._self_health, self._opponent_pos,
+            self._self_health, self._opponent_pos, self._self_mirrored,
         )
 
     def _get_opponent_obs(self):
@@ -285,7 +346,7 @@ class SniperDuelEnv(gym.Env):
         return self._build_obs(
             self._opponent_pos, self._opponent_angle,
             self._opponent_scope_active, self._opponent_scope_charge,
-            self._opponent_health, self._self_pos,
+            self._opponent_health, self._self_pos, self._opponent_mirrored,
         )
 
 
