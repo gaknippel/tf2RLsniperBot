@@ -2,12 +2,21 @@ import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
 
-# custom 1v1map.vmf 
-ARENA_HALF_WIDTH = 1280.0 / 2.0   # x-axis
-ARENA_HALF_LENGTH = 920.0 / 2.0  # y-axis
-
-POSITION_LOW = np.array([-ARENA_HALF_WIDTH, -ARENA_HALF_LENGTH], dtype=np.float32)
-POSITION_HIGH = np.array([ARENA_HALF_WIDTH, ARENA_HALF_LENGTH], dtype=np.float32)
+# custom 1v1map.vmf -- surveyed directly from the compiled map's actual wall
+# brushes (not guessed): inner wall faces are at x=-639/647, y=-479/459. A
+# real TF2 player's collision hull stops ~24 units short of a wall (confirmed
+# empirically via sniperbot_debug: both bots got physically stuck sliding
+# along a wall at x=-614.7/622.8, exactly wall_face -+ ~24.3). The previous
+# symmetric +-640/+-460 box was close to the wall faces themselves but didn't
+# account for that hull radius, and -- more importantly -- assumed ~140 units
+# of retreat room behind each spawn (500 vs 640) when the real map only has
+# ~55-80 (spawn_red is at x=-559.61, only ~55 units from where a bot actually
+# gets stuck). The policy's learned "back away while shooting" style had
+# never experienced running out of room, so it got stuck the first time it
+# tried it for real. These bounds are the real stopping points minus a small
+# safety margin, asymmetric to match the real (not perfectly centered) map.
+POSITION_LOW = np.array([-610.0, -450.0], dtype=np.float32)
+POSITION_HIGH = np.array([615.0, 430.0], dtype=np.float32)
 
 # opposite ends of the arena along the x axis (RED/BLU spawns in 1v1map.vmf),
 # facing each other.
