@@ -39,6 +39,18 @@ BARRIERS = np.array([
 
 LOS_SAMPLE_COUNT = 40  # points checked along the shooter->target line for line-of-sight
 
+# a real TF2 player has a collision hull, so their origin stops this far short
+# of any solid -- confirmed empirically via sniperbot_debug: both bots got
+# stuck jammed against the middle crate at exactly crate_face -+ 24 units
+# (same radius independently confirmed at the outer walls too, see
+# POSITION_LOW/POSITION_HIGH below). The toy env otherwise treats agents as
+# zero-radius points, which let training walk right up to a barrier's exact
+# mathematical edge -- a standoff distance real physics never allows, so the
+# policy had no idea what to do the first time it happened for real. Applies
+# only to movement blocking, never to line-of-sight/aim/fire checks -- a
+# bullet or sightline isn't blocked by the shooter's own hull.
+PLAYER_COLLISION_RADIUS = 24.0
+
 MAX_EPISODE_STEPS = 300
 
 # how far a full-strength (1.0) action value moves/turns an agent in one step
@@ -166,7 +178,7 @@ class SniperDuelEnv(gym.Env):
         move = (strafe * right + fwd_back * forward) * MAX_MOVE_PER_STEP
         new_pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
 
-        if self._point_in_any_barrier(new_pos):
+        if self._point_in_any_barrier(new_pos, padding=PLAYER_COLLISION_RADIUS):
             new_pos = pos  # movement blocked by cover, stay put
 
         angle = angle + mirror_sign * action[2] * MAX_TURN_PER_STEP_DEG
@@ -184,11 +196,11 @@ class SniperDuelEnv(gym.Env):
 
         return scoping_now, scope_charge
 
-    def _point_in_barrier(self, point, barrier):
+    def _point_in_barrier(self, point, barrier, padding=0.0):
         x, y = point
         x_min, x_max, y_min, y_max = barrier
 
-        if x_min <= x <= x_max and y_min <= y <= y_max:
+        if (x_min - padding) <= x <= (x_max + padding) and (y_min - padding) <= y <= (y_max + padding):
             return True
         else:
             return False
@@ -196,9 +208,9 @@ class SniperDuelEnv(gym.Env):
     def _lerp_point(self, a, b, fraction):
         return a + fraction * (b - a)
 
-    def _point_in_any_barrier(self, point):
+    def _point_in_any_barrier(self, point, padding=0.0):
         for barrier in BARRIERS:
-            if self._point_in_barrier(point, barrier):
+            if self._point_in_barrier(point, barrier, padding):
                 return True
 
         return False
