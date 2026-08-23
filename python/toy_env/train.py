@@ -46,7 +46,15 @@ def main():
     os.makedirs(os.path.dirname(FINAL_MODEL_PATH), exist_ok=True)
 
     vec_env = SubprocVecEnv([make_env for _ in range(N_ENVS)])
-    model = PPO("MultiInputPolicy", vec_env, verbose=1, tensorboard_log=TENSORBOARD_LOG_DIR)
+    # ent_coef=0.0 is SB3's default -- i.e. no entropy bonus at all. Without
+    # one, exploration (the policy's action std) is free to collapse the
+    # moment PPO gets confident about *anything*, including a bad passive
+    # local optimum, with nothing left to push it back out. Confirmed twice:
+    # both training collapses so far show the same signature (declining
+    # reward, std/entropy shrinking, explained_variance -> ~0) happening
+    # together. 0.01 is a common default for continuous-action PPO and keeps
+    # a floor of exploration noise throughout training.
+    model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.01, tensorboard_log=TENSORBOARD_LOG_DIR)
 
     timesteps_done = 0
     chunk_index = 0
