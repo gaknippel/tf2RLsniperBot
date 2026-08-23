@@ -29,10 +29,19 @@ OPPONENT_SPAWN_ANGLE = 180.0  # facing -x (BLU), toward self
 
 # top-down (x,y) footprints of the cover brushes in 1v1map.vmf, as
 # (x_min, x_max, y_min, y_max). taken directly from the .vmf solids.
+#
+# The middle crate (was [-28,36]x[-74,118]) was removed from the map
+# (2026-08-22): it sat directly on the spawn-to-spawn sightline, and every
+# retrain kept converging on a symmetric standoff jammed against it,
+# blocking LOS despite the policy already reliably aiming at the correct
+# bearing (on-target 99.5% of episode time, LOS-clear 0%). Removing it
+# opens that direct sightline for free instead of needing the policy to
+# learn to flank around cover it's never once managed to route around. The
+# side pillars stay -- they're off the direct spawn line, so they're not a
+# mandatory obstacle for basic engagement, just optional cover.
 BARRIERS = np.array([
     [-476.0, -412.0, 144.667, 374.0],   # upper-left pillar
     [-476.0, -412.0, -330.0, -100.667], # lower-left pillar
-    [-28.0, 36.0, -74.0, 118.0],        # middle crate
     [400.0, 464.0, 141.667, 371.0],     # upper-right pillar
     [400.0, 464.0, -333.0, -103.667],   # lower-right pillar
 ], dtype=np.float32)
