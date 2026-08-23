@@ -47,6 +47,11 @@ struct SniperBotSlot_t
 
 static SniperBotSlot_t g_SniperBotSlots[2]; // [0] = RED, [1] = BLU
 
+// Must match sniper_duel_env.py's SPAWN_JITTER exactly -- training added
+// this same +-40 unit random offset to both spawns every episode, so the
+// policy actually expects some position variety, not the exact spawn origin.
+static const float SPAWN_JITTER = 40.0f;
+
 // TF2's own spawn-point selection (run by ForceRespawn()) is what
 // round_manager.nut's ResetRound() explicitly works around every round --
 // it doesn't trust the engine to land a player back on "spawn_red"/
@@ -56,13 +61,24 @@ static SniperBotSlot_t g_SniperBotSlots[2]; // [0] = RED, [1] = BLU
 // point exists per team, per the .vmf, so this shouldn't be ambiguous, but
 // evidently something about it isn't reliable for a freshly-created fake
 // client), pin the position ourselves instead of trusting it.
+//
+// Also jitters x/y (not z, not facing angle -- training never varied those
+// either) so the bot doesn't tele to the exact same spot life after life.
+// With a single shared self-play policy and deterministic inference, two
+// bots dueling each other from unjittered spawns produce near-perfectly
+// mirrored trajectories every time (expected, not a bug -- see project
+// notes) -- this at least breaks that up, though the real fix for "feels
+// different every fight" is that a human opponent is never deterministic.
 static void PinToNamedSpawn( CTFPlayer *pBot, int iTeam )
 {
 	const char *pszSpawnName = ( iTeam == TF_TEAM_RED ) ? "spawn_red" : "spawn_blu";
 	CBaseEntity *pSpawn = gEntList.FindEntityByName( NULL, pszSpawnName );
 	if ( pSpawn )
 	{
-		pBot->Teleport( &pSpawn->GetAbsOrigin(), &pSpawn->GetAbsAngles(), NULL );
+		Vector vecSpawn = pSpawn->GetAbsOrigin();
+		vecSpawn.x += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
+		vecSpawn.y += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
+		pBot->Teleport( &vecSpawn, &pSpawn->GetAbsAngles(), NULL );
 	}
 }
 

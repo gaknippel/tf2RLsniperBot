@@ -74,6 +74,14 @@ SHAPING_SCALE = 0.01     # small per-step reward for being aimed at the opponent
 MISS_PENALTY = 0.02      # small per-shot cost when firing lands no damage -- discourages
                           # constant spam-fire (the toy env has no ammo limit, so without
                           # this a policy has zero incentive to hold fire until actually aimed)
+STEP_PENALTY = 0.003     # tiny constant per-step cost, regardless of action -- passivity
+                          # (never engaging, riding out the timeout) nets exactly 0 reward
+                          # otherwise, which self-play can slide into once engaging gets even
+                          # slightly harder (confirmed: barrier-collision padding alone
+                          # collapsed a run to 48% timeouts, ~0 explained_variance). This
+                          # makes standing around strictly worse than trying, without being
+                          # large enough to distort the terminal win/loss incentive
+                          # (0.003 * 300 max steps = 0.9, tiny next to TERMINAL_REWARD=100).
 
 
 class SniperDuelEnv(gym.Env):
@@ -307,6 +315,12 @@ class SniperDuelEnv(gym.Env):
             # without a cost the policy has no reason to ever hold fire.
             if action[4] > 0.0 and damage_to_opponent <= 0.0:
                 reward -= MISS_PENALTY
+
+            # discourage riding out the clock -- passivity would otherwise
+            # net exactly 0 reward forever, an easy local optimum for
+            # self-play to collapse into once engaging gets even slightly
+            # harder.
+            reward -= STEP_PENALTY
 
         terminated = self_dead or opponent_dead
         truncated = self._step_count >= MAX_EPISODE_STEPS
