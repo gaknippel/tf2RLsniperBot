@@ -30,18 +30,20 @@ OPPONENT_SPAWN_ANGLE = 180.0  # facing -x (BLU), toward self
 # top-down (x,y) footprints of the cover brushes in 1v1map.vmf, as
 # (x_min, x_max, y_min, y_max). taken directly from the .vmf solids.
 #
-# The middle crate (was [-28,36]x[-74,118]) was removed from the map
-# (2026-08-22): it sat directly on the spawn-to-spawn sightline, and every
-# retrain kept converging on a symmetric standoff jammed against it,
-# blocking LOS despite the policy already reliably aiming at the correct
-# bearing (on-target 99.5% of episode time, LOS-clear 0%). Removing it
-# opens that direct sightline for free instead of needing the policy to
-# learn to flank around cover it's never once managed to route around. The
-# side pillars stay -- they're off the direct spawn line, so they're not a
-# mandatory obstacle for basic engagement, just optional cover.
+# The middle crate was removed (2026-08-22) after every retrain kept
+# converging on a symmetric standoff jammed against it (on-target 99.5% of
+# episode time, LOS-clear 0%) -- but removing it left a fully open
+# spawn-to-spawn sightline, which just produced instant 3-step point-blank
+# trades from spawn instead. Restored (rebuilt slightly differently, not
+# identical to the original -- x=[-65,64] y=[-67,109] now, was
+# [-28,36]x[-74,118]) so there's a real obstruction to force some actual
+# positioning before shots land. This time paired with LOS_SHAPING_SCALE
+# (see reward code) to actually reward the intermediate step of maneuvering
+# toward a sightline, instead of only rewarding the fully-aimed end state.
 BARRIERS = np.array([
     [-476.0, -412.0, 144.667, 374.0],   # upper-left pillar
     [-476.0, -412.0, -330.0, -100.667], # lower-left pillar
+    [-65.0, 64.0, -67.0, 109.0],        # middle crate (rebuilt, larger than original)
     [400.0, 464.0, 141.667, 371.0],     # upper-right pillar
     [400.0, 464.0, -333.0, -103.667],   # lower-right pillar
 ], dtype=np.float32)
@@ -91,6 +93,13 @@ STEP_PENALTY = 0.003     # tiny constant per-step cost, regardless of action -- 
                           # makes standing around strictly worse than trying, without being
                           # large enough to distort the terminal win/loss incentive
                           # (0.003 * 300 max steps = 0.9, tiny next to TERMINAL_REWARD=100).
+LOS_SHAPING_SCALE = 0.003  # small reward for LOS alone, independent of being on-target --
+                            # without this, "blocked by cover" and "actively maneuvering
+                            # toward an open sightline" score identically (0 reward) right up
+                            # until the instant everything lines up. SHAPING_SCALE (on-target
+                            # AND LOS together) is worth more, so this only adds a gradient
+                            # toward "getting closer", it doesn't replace the incentive to
+                            # actually finish aiming.
 
 
 class SniperDuelEnv(gym.Env):
@@ -314,11 +323,21 @@ class SniperDuelEnv(gym.Env):
             # require actual LOS, not just angle -- otherwise "facing the
             # opponent's raw bearing through a wall" farms the same reward as
             # genuinely having them in your sights, with none of the risk.
+            has_los = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
             aimed_at_opponent = (
                 self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
-                and self._line_of_sight_clear(self._self_pos, self._opponent_pos)
+                and has_los
             )
-            reward = SHAPING_SCALE if aimed_at_opponent else 0.0
+            if aimed_at_opponent:
+                reward = SHAPING_SCALE
+            elif has_los:
+                # partial credit for having a real sightline even before
+                # being aimed -- otherwise "blocked by cover" and "actively
+                # maneuvering toward an open angle" both score 0, with no
+                # gradient telling the policy it's making progress.
+                reward = LOS_SHAPING_SCALE
+            else:
+                reward = 0.0
 
             # discourage constant spam-fire -- the env has no ammo limit, so
             # without a cost the policy has no reason to ever hold fire.
