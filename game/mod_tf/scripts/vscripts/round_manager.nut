@@ -133,9 +133,9 @@ function Init()
     //force custom cfg for 1v1 map
     SendToConsole("exec 1v1map")
 
-    //spawns the trained-policy RL sniper duel pair (see tf_sniper_bot.cpp)
-    //not the official valve bot with nextbot ai
-    CreateScheduleEvent(1.0, function() { SendToConsole("bot_rl_duel") })
+    //spawns the trained-policy RL sniper bot on RED (see tf_sniper_bot.cpp)
+    //not the official valve bot with nextbot ai -- join BLU to fight it
+    CreateScheduleEvent(1.0, function() { SendToConsole("bot_rl_solo") })
 
     printl("=== round_manager.nut loaded. max rounds: " + MAX_ROUNDS + " ===")
 }

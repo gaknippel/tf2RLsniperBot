@@ -15,8 +15,16 @@
 
 // Round/respawn/heal flow is already owned by round_manager.nut (see
 // game/mod_tf/scripts/vscripts/) -- this file only drives movement/aim/
-// scope/fire for whichever of the two bots are currently alive. It does not
-// touch team score, round counting, or respawn timing.
+// scope/fire for the RL bot while it's alive. It does not touch team score,
+// round counting, or respawn timing.
+//
+// 2026-08-25: dropped self-play (mirrored dual-role training against a
+// frozen copy of itself) for training against a scripted opponent whose
+// difficulty ramps over the run -- see sniper_duel_env.py's "scripted
+// opponent" block comment for why. There is now exactly one trained role
+// (RED, canonical frame, matches SELF_SPAWN/SELF_SPAWN_ANGLE) and no BLU-side
+// RL bot, so the observation/action mirroring and the two-bot duel path this
+// file used to have are both gone. Join BLU as a human to fight it.
 
 // Real time isn't the same axis the toy env trained on (each training env
 // "step" was an abstract unit, not a fixed wall-clock duration), so these
@@ -45,34 +53,28 @@ struct SniperBotSlot_t
 	bool bWasAlive;
 };
 
-static SniperBotSlot_t g_SniperBotSlots[2]; // [0] = RED, [1] = BLU
+static SniperBotSlot_t g_SniperBot; // RED only -- see the file-header comment.
 
 // Must match sniper_duel_env.py's SPAWN_JITTER exactly -- training added
-// this same +-40 unit random offset to both spawns every episode, so the
+// this same +-40 unit random offset to the spawn every episode, so the
 // policy actually expects some position variety, not the exact spawn origin.
 static const float SPAWN_JITTER = 40.0f;
 
 // TF2's own spawn-point selection (run by ForceRespawn()) is what
 // round_manager.nut's ResetRound() explicitly works around every round --
-// it doesn't trust the engine to land a player back on "spawn_red"/
-// "spawn_blu" and instead looks the named entity up and teleports there
-// directly. Do the same thing here for the same reason: whatever the
-// engine's spawn-point resolution is actually doing (only one candidate
-// point exists per team, per the .vmf, so this shouldn't be ambiguous, but
-// evidently something about it isn't reliable for a freshly-created fake
-// client), pin the position ourselves instead of trusting it.
+// it doesn't trust the engine to land a player back on "spawn_red" and
+// instead looks the named entity up and teleports there directly. Do the
+// same thing here for the same reason: whatever the engine's spawn-point
+// resolution is actually doing (only one candidate point exists per team,
+// per the .vmf, so this shouldn't be ambiguous, but evidently something
+// about it isn't reliable for a freshly-created fake client), pin the
+// position ourselves instead of trusting it.
 //
 // Also jitters x/y (not z, not facing angle -- training never varied those
 // either) so the bot doesn't tele to the exact same spot life after life.
-// With a single shared self-play policy and deterministic inference, two
-// bots dueling each other from unjittered spawns produce near-perfectly
-// mirrored trajectories every time (expected, not a bug -- see project
-// notes) -- this at least breaks that up, though the real fix for "feels
-// different every fight" is that a human opponent is never deterministic.
-static void PinToNamedSpawn( CTFPlayer *pBot, int iTeam )
+static void PinToNamedSpawn( CTFPlayer *pBot )
 {
-	const char *pszSpawnName = ( iTeam == TF_TEAM_RED ) ? "spawn_red" : "spawn_blu";
-	CBaseEntity *pSpawn = gEntList.FindEntityByName( NULL, pszSpawnName );
+	CBaseEntity *pSpawn = gEntList.FindEntityByName( NULL, "spawn_red" );
 	if ( pSpawn )
 	{
 		Vector vecSpawn = pSpawn->GetAbsOrigin();
@@ -82,77 +84,56 @@ static void PinToNamedSpawn( CTFPlayer *pBot, int iTeam )
 	}
 }
 
-static CTFPlayer *SpawnOneSniperBot( int iTeam, const char *pszName )
+static CTFPlayer *SpawnOneSniperBot( const char *pszName )
 {
-	CBasePlayer *pPlayer = BotPutInServer( false, false, iTeam, TF_CLASS_SNIPER, pszName );
+	CBasePlayer *pPlayer = BotPutInServer( false, false, TF_TEAM_RED, TF_CLASS_SNIPER, pszName );
 	if ( !pPlayer )
 		return NULL;
 
 	CTFPlayer *pBot = ToTFPlayer( pPlayer );
 	pBot->SetPlayerType( CTFPlayer::RL_BOT );
 
-	const char *pszTeamName = ( iTeam == TF_TEAM_RED ) ? "red" : "blue";
-	pBot->HandleCommand_JoinTeam( pszTeamName );
+	pBot->HandleCommand_JoinTeam( "red" );
 	pBot->HandleCommand_JoinClass( GetPlayerClassData( TF_CLASS_SNIPER )->m_szClassName );
 	pBot->ForceRespawn();
-	PinToNamedSpawn( pBot, iTeam );
+	PinToNamedSpawn( pBot );
 
 	return pBot;
 }
 
-void SniperBot_SpawnDuel()
+// Spawns (or respawns) the single RED RL bot. SniperBot_RunAll() picks up
+// whichever live human is on BLU as its opponent -- see FindHumanOpponent.
+void SniperBot_SpawnSolo()
 {
-	if ( g_SniperBotSlots[0].hBot.Get() )
+	if ( g_SniperBot.hBot.Get() )
 	{
-		g_SniperBotSlots[0].hBot->ForceRespawn();
-		PinToNamedSpawn( g_SniperBotSlots[0].hBot, TF_TEAM_RED );
+		g_SniperBot.hBot->ForceRespawn();
+		PinToNamedSpawn( g_SniperBot.hBot );
 	}
 	else
 	{
-		g_SniperBotSlots[0].hBot = SpawnOneSniperBot( TF_TEAM_RED, "jerry" );
+		g_SniperBot.hBot = SpawnOneSniperBot( "jerry" );
 	}
-	g_SniperBotSlots[0].flAliveSince = gpGlobals->curtime;
-	g_SniperBotSlots[0].bWasAlive = true;
-
-	if ( g_SniperBotSlots[1].hBot.Get() )
-	{
-		g_SniperBotSlots[1].hBot->ForceRespawn();
-		PinToNamedSpawn( g_SniperBotSlots[1].hBot, TF_TEAM_BLUE );
-	}
-	else
-	{
-		g_SniperBotSlots[1].hBot = SpawnOneSniperBot( TF_TEAM_BLUE, "terry" );
-	}
-	g_SniperBotSlots[1].flAliveSince = gpGlobals->curtime;
-	g_SniperBotSlots[1].bWasAlive = true;
+	g_SniperBot.flAliveSince = gpGlobals->curtime;
+	g_SniperBot.bWasAlive = true;
 }
 
 void SniperBot_RemoveDuel()
 {
-	for ( int i = 0; i < 2; ++i )
+	CTFPlayer *pBot = g_SniperBot.hBot.Get();
+	if ( pBot )
 	{
-		CTFPlayer *pBot = g_SniperBotSlots[i].hBot.Get();
-		if ( pBot )
-		{
-			engine->ServerCommand( UTIL_VarArgs( "kickid %d\n", pBot->GetUserID() ) );
-		}
-		g_SniperBotSlots[i].hBot = NULL;
+		engine->ServerCommand( UTIL_VarArgs( "kickid %d\n", pBot->GetUserID() ) );
 	}
+	g_SniperBot.hBot = NULL;
 }
 
 // Builds the observation vector in the exact order tf_sniper_policy_weights.h
-// documents (== export_policy.py's OBS_KEY_ORDER), from this bot's point of
-// view with pOpponent as "the opponent".
-//
-// bMirrored must match sniper_duel_env.py's per-agent mirroring: the policy
-// was retrained to always perceive itself in one canonical frame (as if
-// spawned at SELF_SPAWN facing +x) regardless of which physical spawn it's
-// actually on -- RED (spawn_red, facing 0 deg) matches that frame directly,
-// but BLU (spawn_blu, facing 180 deg) must have its x-coordinates and yaw
-// reflected before being fed to the network, or the retrained weights
-// reproduce the exact same one-side-only-competent bug this was meant to
-// fix. See ApplyAction for the matching un-mirror on the way back out.
-static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAliveSince, bool bMirrored, float obs[SniperPolicy::kObsSize] )
+// documents (== export_policy.py's OBS_KEY_ORDER), from the bot's point of
+// view with pOpponent as "the opponent". No mirroring -- the bot only ever
+// plays the canonical RED role (spawn_red, facing +x) the policy was trained
+// as, so its real coordinates/yaw already match the training frame directly.
+static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAliveSince, float obs[SniperPolicy::kObsSize] )
 {
 	bool bOpponentVisible = pBot->FVisible( pOpponent );
 
@@ -162,26 +143,19 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
 
 	float flYaw = AngleNormalize( pBot->EyeAngles().y );
-	if ( bMirrored )
-	{
-		flYaw = AngleNormalize( 180.0f - flYaw );
-	}
-
-	float flSelfX = bMirrored ? -vecSelf.x : vecSelf.x;
-	float flOpponentX = bMirrored ? -vecOpponent.x : vecOpponent.x;
 
 	float flTimeLeft = 1.0f - ( ( gpGlobals->curtime - flAliveSince ) / EPISODE_DURATION_SECONDS );
 	flTimeLeft = clamp( flTimeLeft, 0.0f, 1.0f );
 
 	int i = 0;
-	obs[i++] = bOpponentVisible ? flOpponentX : 0.0f;
+	obs[i++] = bOpponentVisible ? vecOpponent.x : 0.0f;
 	obs[i++] = bOpponentVisible ? vecOpponent.y : 0.0f;
 	obs[i++] = bOpponentVisible ? 1.0f : 0.0f;
 	obs[i++] = ( pRifle && pRifle->IsZoomed() ) ? 1.0f : 0.0f;
 	obs[i++] = pRifle ? pRifle->GetProgress() : 0.0f;
 	obs[i++] = flYaw;
 	obs[i++] = clamp( (float)pBot->GetHealth() / (float)pBot->GetMaxHealth(), 0.0f, 1.0f );
-	obs[i++] = flSelfX;
+	obs[i++] = vecSelf.x;
 	obs[i++] = vecSelf.y;
 	obs[i++] = flTimeLeft;
 	Assert( i == SniperPolicy::kObsSize );
@@ -192,17 +166,17 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 // and runs it, the same way tf_bot_temp.cpp's RunPlayerMove() does for the
 // waypoint bots.
 //
-// bMirrored must match the flag passed to BuildObservation for this same
-// bot. The network's strafe/turn output is a canonical-frame intention;
-// mirroring the world is a reflection, which flips chirality, so a mirrored
-// bot's real-world strafe and turn must both be negated (forward/back,
-// scope, and fire are unaffected -- see sniper_duel_env.py's _move_agent
-// for the derivation of exactly which components flip).
-static void ApplyAction( CTFPlayer *pBot, const float action[SniperPolicy::kActionSize], bool bMirrored )
+// 2026-08-25: the fire button is hard-gated on pBot->FVisible( pOpponent )
+// here, regardless of what the policy outputs. Live testing showed the bot
+// holding fire essentially constantly, including through cover -- reward
+// shaping aimed at teaching this in training (a heavier penalty for firing
+// with no LOS) was tried and reverted after it destabilized training (see
+// sniper_duel_env.py's MISS_PENALTY comment); enforcing it as a real
+// engine-visibility check here instead is simpler and can't be wrong the
+// way a learned habit can.
+static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float action[SniperPolicy::kActionSize] )
 {
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
-
-	float flMirrorSign = bMirrored ? -1.0f : 1.0f;
 
 	// Clamp frametime for the turn integration -- a single unusually long
 	// server frame (e.g. a hitch right at bot spawn) would otherwise translate
@@ -210,7 +184,7 @@ static void ApplyAction( CTFPlayer *pBot, const float action[SniperPolicy::kActi
 	float flTurnFrametime = MIN( gpGlobals->frametime, 0.1f );
 
 	QAngle angViewAngles = pBot->EyeAngles();
-	angViewAngles.y = AngleNormalize( angViewAngles.y + flMirrorSign * action[2] * TURN_RATE_DEG_PER_SEC * flTurnFrametime );
+	angViewAngles.y = AngleNormalize( angViewAngles.y + action[2] * TURN_RATE_DEG_PER_SEC * flTurnFrametime );
 	angViewAngles.x = 0.0f;
 	angViewAngles.z = 0.0f;
 
@@ -225,7 +199,7 @@ static void ApplyAction( CTFPlayer *pBot, const float action[SniperPolicy::kActi
 		usButtons |= IN_ATTACK2;
 	}
 
-	if ( action[4] > 0.0f )
+	if ( action[4] > 0.0f && pBot->FVisible( pOpponent ) )
 	{
 		usButtons |= IN_ATTACK;
 	}
@@ -234,7 +208,7 @@ static void ApplyAction( CTFPlayer *pBot, const float action[SniperPolicy::kActi
 	Q_memset( &cmd, 0, sizeof( cmd ) );
 	VectorCopy( angViewAngles, cmd.viewangles );
 	cmd.forwardmove = action[1] * pBot->MaxSpeed();
-	cmd.sidemove = flMirrorSign * action[0] * pBot->MaxSpeed();
+	cmd.sidemove = action[0] * pBot->MaxSpeed();
 	cmd.upmove = 0;
 	cmd.buttons = usButtons;
 	cmd.impulse = 0;
@@ -261,26 +235,24 @@ static void ApplyAction( CTFPlayer *pBot, const float action[SniperPolicy::kActi
 }
 
 static ConVar sniperbot_debug( "sniperbot_debug", "0", FCVAR_CHEAT,
-	"Print each sniper duel bot's observation/action vector to console periodically." );
+	"Print the sniper duel bot's observation/action vector to console periodically." );
 
-static void DebugPrintTick( CTFPlayer *pBot, CTFPlayer *pOpponent, bool bMirrored, const float obs[SniperPolicy::kObsSize], const float action[SniperPolicy::kActionSize] )
+static void DebugPrintTick( CTFPlayer *pBot, CTFPlayer *pOpponent, const float obs[SniperPolicy::kObsSize], const float action[SniperPolicy::kActionSize] )
 {
 	if ( !sniperbot_debug.GetBool() )
 		return;
 
-	// throttle to ~2x/sec per bot instead of every tick
-	static float s_flNextPrint[2] = { 0.0f, 0.0f };
-	int iSlot = ( pBot->GetTeamNumber() == TF_TEAM_RED ) ? 0 : 1;
-	if ( gpGlobals->curtime < s_flNextPrint[iSlot] )
+	// throttle to ~2x/sec instead of every tick
+	static float s_flNextPrint = 0.0f;
+	if ( gpGlobals->curtime < s_flNextPrint )
 		return;
-	s_flNextPrint[iSlot] = gpGlobals->curtime + 0.5f;
+	s_flNextPrint = gpGlobals->curtime + 0.5f;
 
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
 	const Vector &vecOpponentReal = pOpponent->GetAbsOrigin();
 
-	Msg( "[sniperbot] %s mirrored=%d raw_pos=(%.1f,%.1f) raw_yaw=%.1f rifle_active=%d opp_real_pos=(%.1f,%.1f) obs=[opp_pos=(%.1f,%.1f) opp_vis=%.0f scope_act=%.0f scope_chg=%.2f self_ang=%.1f self_hp=%.2f self_pos=(%.1f,%.1f) t_left=%.2f] action=[strafe=%.2f fwd=%.2f turn=%.2f scope=%.2f fire=%.2f]\n",
+	Msg( "[sniperbot] %s raw_pos=(%.1f,%.1f) raw_yaw=%.1f rifle_active=%d opp_real_pos=(%.1f,%.1f) obs=[opp_pos=(%.1f,%.1f) opp_vis=%.0f scope_act=%.0f scope_chg=%.2f self_ang=%.1f self_hp=%.2f self_pos=(%.1f,%.1f) t_left=%.2f] action=[strafe=%.2f fwd=%.2f turn=%.2f scope=%.2f fire=%.2f]\n",
 		pBot->GetPlayerName(),
-		bMirrored ? 1 : 0,
 		pBot->GetAbsOrigin().x, pBot->GetAbsOrigin().y,
 		AngleNormalize( pBot->EyeAngles().y ),
 		pRifle ? 1 : 0,
@@ -294,61 +266,71 @@ static bool isRLBot( CTFPlayer *pPlayer )
 	return pPlayer && ( pPlayer->GetFlags() & FL_FAKECLIENT ) && pPlayer->GetPlayerType() == CTFPlayer::RL_BOT;
 }
 
+// First live, non-RL-bot player found on iTeam -- this is the RL bot's
+// opponent whenever a real player is on BLU, so the policy gets a live
+// human's real position fed into it every tick.
+static CTFPlayer *FindHumanOpponent( int iTeam )
+{
+	for ( int i = 1; i <= gpGlobals->maxClients; ++i )
+	{
+		CTFPlayer *pPlayer = ToTFPlayer( UTIL_PlayerByIndex( i ) );
+		if ( !pPlayer || isRLBot( pPlayer ) || !pPlayer->IsAlive() )
+			continue;
+
+		if ( pPlayer->GetTeamNumber() != iTeam )
+			continue;
+
+		return pPlayer;
+	}
+
+	return NULL;
+}
+
 void SniperBot_RunAll()
 {
-	CTFPlayer *pRed = g_SniperBotSlots[0].hBot.Get();
-	CTFPlayer *pBlue = g_SniperBotSlots[1].hBot.Get();
-
-	if ( !isRLBot( pRed ) || !isRLBot( pBlue ) )
+	CTFPlayer *pBot = g_SniperBot.hBot.Get();
+	if ( !isRLBot( pBot ) )
 		return;
+
+	if ( !pBot->IsAlive() )
+	{
+		g_SniperBot.bWasAlive = false;
+		return;
+	}
+
+	CTFPlayer *pOpponent = FindHumanOpponent( TF_TEAM_BLUE );
+	if ( !pOpponent )
+		return; // nobody on BLU yet -- wait for a human to join/respawn
 
 	MDLCACHE_CRITICAL_SECTION();
 
-	CTFPlayer *pPair[2] = { pRed, pBlue };
-	CTFPlayer *pOpponentOf[2] = { pBlue, pRed };
-	// RED (spawn_red, facing 0 deg) matches the toy env's canonical SELF_SPAWN
-	// frame directly; BLU (spawn_blu, facing 180 deg) needs the mirror -- see
-	// BuildObservation/ApplyAction.
-	bool bMirroredOf[2] = { false, true };
-
-	for ( int i = 0; i < 2; ++i )
+	if ( !g_SniperBot.bWasAlive )
 	{
-		CTFPlayer *pBot = pPair[i];
-
-		if ( !pBot->IsAlive() )
-		{
-			g_SniperBotSlots[i].bWasAlive = false;
-			continue;
-		}
-
-		if ( !g_SniperBotSlots[i].bWasAlive )
-		{
-			// just respawned -- restart this bot's time_left clock
-			g_SniperBotSlots[i].flAliveSince = gpGlobals->curtime;
-			g_SniperBotSlots[i].bWasAlive = true;
-		}
-
-		float obs[SniperPolicy::kObsSize];
-		BuildObservation( pBot, pOpponentOf[i], g_SniperBotSlots[i].flAliveSince, bMirroredOf[i], obs );
-
-		float action[SniperPolicy::kActionSize];
-		SniperPolicy::Forward( obs, action );
-
-		DebugPrintTick( pBot, pOpponentOf[i], bMirroredOf[i], obs, action );
-
-		ApplyAction( pBot, action, bMirroredOf[i] );
+		// just respawned -- restart this bot's time_left clock
+		g_SniperBot.flAliveSince = gpGlobals->curtime;
+		g_SniperBot.bWasAlive = true;
 	}
+
+	float obs[SniperPolicy::kObsSize];
+	BuildObservation( pBot, pOpponent, g_SniperBot.flAliveSince, obs );
+
+	float action[SniperPolicy::kActionSize];
+	SniperPolicy::Forward( obs, action );
+
+	DebugPrintTick( pBot, pOpponent, obs, action );
+
+	ApplyAction( pBot, pOpponent, action );
 }
 
-CON_COMMAND_F( bot_rl_duel, "Spawn (or restart) the two trained-policy sniper-duel bots.", FCVAR_CHEAT )
+CON_COMMAND_F( bot_rl_solo, "Spawn (or restart) the trained-policy sniper bot on RED. Join BLU as a human to fight it.", FCVAR_CHEAT )
 {
 	if ( !UTIL_IsCommandIssuedByServerAdmin() )
 		return;
 
-	SniperBot_SpawnDuel();
+	SniperBot_SpawnSolo();
 }
 
-CON_COMMAND_F( bot_rl_stop, "Remove the trained-policy sniper-duel bots.", FCVAR_CHEAT )
+CON_COMMAND_F( bot_rl_stop, "Remove the trained-policy sniper bot.", FCVAR_CHEAT )
 {
 	if ( !UTIL_IsCommandIssuedByServerAdmin() )
 		return;
