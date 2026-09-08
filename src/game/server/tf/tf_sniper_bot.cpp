@@ -174,6 +174,25 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 // sniper_duel_env.py's MISS_PENALTY comment); enforcing it as a real
 // engine-visibility check here instead is simpler and can't be wrong the
 // way a learned habit can.
+//
+// 2026-09-08: same story, second exploit. Live testing also showed the bot
+// spinning continuously at max turn rate while holding the fire button down
+// -- a fast spin sweeps across FVisible() often enough to intermittently
+// land free kills without the policy ever needing to actually settle onto
+// target. Four different attempts to close this in TRAINING itself (gating
+// the agent's own fire on N consecutive on-target frames, a decaying
+// version of the same, one with an added reward gradient, and finally an
+// instantaneous check on the shooter's current turn action -- see
+// sniper_duel_env.py's long comment above _resolve_fire) all destabilized
+// PPO's training dynamics once tested against the real curriculum's actual
+// shape, despite the underlying reward economy otherwise being proven
+// stable. Enforcing "don't fire while turning fast" here instead, on the
+// trained policy's raw action output, sidesteps training entirely -- same
+// fix category as the FVisible() gate above, and the threshold matches what
+// sniper_duel_env.py's abandoned MAX_TURN_WHILE_FIRING settled on before
+// that whole mechanic was reverted.
+static const float MAX_TURN_ACTION_WHILE_FIRING = 0.35f;
+
 static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float action[SniperPolicy::kActionSize] )
 {
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
@@ -199,7 +218,7 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 		usButtons |= IN_ATTACK2;
 	}
 
-	if ( action[4] > 0.0f && pBot->FVisible( pOpponent ) )
+	if ( action[4] > 0.0f && pBot->FVisible( pOpponent ) && fabsf( action[2] ) <= MAX_TURN_ACTION_WHILE_FIRING )
 	{
 		usButtons |= IN_ATTACK;
 	}

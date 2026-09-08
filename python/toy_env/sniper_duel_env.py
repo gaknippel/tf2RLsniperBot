@@ -86,55 +86,59 @@ MAX_HEADSHOT_DAMAGE = 450.0    # headshot damage at full (1.0) charge
 # tracking -- confirmed live via sniperbot_debug: the deployed bot span
 # continuously at ~TURN_RATE_DEG_PER_SEC while firing almost every tick, and
 # the toy sim's own 600/600 eval was the exact same behavior, just never
-# rendered/inspected, only win/loss-counted. Requiring a held aim closes the
-# exploit at the mechanic, not just the reward -- a fast spin resets the
-# streak every frame, so it can never accumulate enough to land a hit. 3
-# matches the "~3 steps of scoping" feel MIN_CHARGE_FOR_HEADSHOT already
-# established elsewhere in this file.
+# rendered/inspected, only win/loss-counted.
 #
-# 2026-09-03: gating BOTH sides' fire on this (N=3, then N=2 -- two 2M-step
-# trials each) reverted to the exact "avoid engaging entirely" passivity floor
-# this project already fought once (ep_rew_mean flat negative, std creeping UP
-# instead of shrinking). Root cause was the *symmetry*, not the threshold
-# value -- see the step()-site comment where this is applied. Fixed by only
-# gating the agent's own shots (required_streak=REQUIRE_SUSTAINED_AIM_STEPS)
-# and leaving the scripted opponent's shots ungated (required_streak=1, i.e.
-# its original, already-stable single-on-target-frame behavior).
+# 2026-09-03 through 2026-09-08: spent roughly a dozen 2M-6M-step trials
+# trying to close this by gating the agent's own fire on SOME condition tied
+# to how it was aiming -- N consecutive on-target+LOS frames (hard-reset at
+# N=3 and N=2, symmetric and asymmetric), the same streak but decaying by 1
+# on a miss instead of hard-resetting, an added reward gradient toward
+# holding aim, headshots exempted from the gate, and finally an instantaneous
+# (no history at all) check on the shooter's current turn-rate at the moment
+# of firing. One combination (decay-on-miss + N=2 + headshot-exempt) even
+# validated clean on a full 2M-step held-at-max-difficulty run. Every single
+# one of these -- all the way down to the memory-free turn-rate version --
+# failed the same way once tested against the REAL curriculum's actual
+# shape: a continuous 0->1 ramp with no hold. std climbed steadily and never
+# recovered as difficulty rose past ~0.1-0.3, reproduced in the real 50M-step
+# run (0.24->1.51 by difficulty 0.53), a 6M-step trial of the decay/N=2/
+# headshot-exempt fix (0.77->1.01+ by difficulty ~0.5), and again in a 6M-step
+# trial of the turn-rate version (0.79->1.3+ by difficulty ~0.68) -- three
+# structurally different mechanics, identical failure curve. A held-difficulty
+# harness made some of these look fixed only because its ramp physically
+# stopped moving partway through and held there; that's an artifact of the
+# harness, not evidence any of the fixes were sound, and it never applies to
+# the real, continuously-ramping curriculum.
 #
-# 2026-09-04: even asymmetric, N=3 still failed at the difficulty curriculum's
-# high end -- confirmed via a diagnostic trial that pinned difficulty at 1.0
-# for a full 1M steps (ruling out "curriculum ramps too fast for a short
-# trial" as the cause): std never recovered, climbing 0.94->1.13 and
-# plateauing there instead of shrinking, reward stuck negative throughout.
-# Also tried adding STREAK_SHAPING_SCALE (reward that ramps with streak
-# progress, see below) to rule out "no gradient toward holding aim" -- same
-# failure curve almost exactly, so that wasn't it either. Dropping to N=2
-# alone didn't help either (std climbed even further, to 1.28).
+# The decisive test: run the ORIGINAL, fully ungated mechanic (below) through
+# that same continuous-ramp harness. std shrank smoothly and monotonically
+# the entire way (0.92 -> 0.47 by difficulty 0.68, still falling) -- clean,
+# with zero instability, at exactly the difficulty range where every gated
+# variant blew up. That rules out the ramp itself, or ent_coef=0.0, or the
+# reward economy as the cause: this exact env, unmodified, trains fine.
+# It's specifically ANY constraint placed on the agent's own fire -- no
+# matter how it's implemented -- that breaks PPO's training dynamics here.
+# Best guess why: it's an asymmetric nerf that compounds. The opponent's
+# shots stay ungated the whole time (by design, to protect its threat
+# model), so as its own aim/fire-chance sharpen with difficulty, the agent
+# is simultaneously being asked to clear an extra bar just to return fire at
+# all -- and unlike a fixed-difficulty opponent, there's no difficulty level
+# where that tradeoff ever settles into an equilibrium the policy can lock
+# onto; the target keeps moving. A single-step, history-free check should in
+# principle have been the easiest version of this to learn, and it failed
+# just as hard as the others -- strong evidence the complexity of the gate
+# was never the actual problem, just any bar placed on it at all.
 #
-# 2026-09-04: root-caused via a control trial -- removing the gate entirely
-# (required_streak=1, i.e. the original exploit-open behavior) run through
-# the same held-at-difficulty-1.0 harness kept std FLAT (~0.85-0.87) the
-# whole window, proving the gate itself, not difficulty or curriculum
-# pacing, was what destabilized training. Root cause: a hard reset-to-0 on
-# any single missed frame punishes one bobble while genuinely tracking a
-# moving, shooting-back target exactly as hard as never having aimed at
-# all, forcing a full rebuild from scratch -- an unrealistic bar against a
-# difficulty=1.0 opponent (near-zero aim noise, fast turn-in, ~70%/frame
-# fire chance once lined up, no sustained-aim gate on ITS shots). Fixed by
-# changing the streak to DECAY by 1 on a miss instead of hard-resetting
-# (see the step()-site comment) -- still can't be satisfied by a spin or a
-# single flicker (off-frames dominate on-frames within one rotation, so the
-# streak nets toward 0 over time), but tolerates one missed frame without
-# erasing an otherwise-real hold. Combined with N=2 and the headshot
-# exemption below, this fully validated on a full 2M-step run through the
-# held-difficulty harness: std shrank smoothly 0.87->0.50 (vs. climbing to
-# 1.1-1.3 for every hard-reset variant, and better than even the ungated
-# control's flat 0.85-0.87), ep_rew_mean went net positive for most of the
-# back quarter of the run, and ep_len_mean dropped to ~270-284 (kills
-# actually happening), all while difficulty stayed pinned at the hardest
-# setting the whole time. This is the first variant of this fix that has
-# actually looked healthy end-to-end -- trusted for the real 50M-step run.
-REQUIRE_SUSTAINED_AIM_STEPS = 2
+# Given that, the fire-resolution mechanic below is being left exactly as it
+# was before any of this -- proven stable through the full realistic
+# curriculum -- and the actual fix for the spin-and-spray behavior belongs at
+# the deployment layer instead, mirroring how the blind-fire issue was
+# already solved that way (see MISS_PENALTY's comment below): gate the real
+# fire button in tf_sniper_bot.cpp's ApplyAction on the bot's actual in-engine
+# angular velocity at the moment of firing, the same way it's already gated
+# on the engine's real FVisible() check. That enforces "don't fire while
+# spinning" deterministically on the trained policy's output, without asking
+# training itself to solve a problem it has now failed four different ways.
 
 TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shaping
 # 2026-08-25: raised SHAPING_SCALE/LOS_SHAPING_SCALE ~5x (were 0.01/0.003) after two
@@ -178,18 +182,6 @@ LOS_SHAPING_SCALE = 0.02  # reward for LOS alone, independent of being on-target
                             # together) is worth more, so this only adds a gradient toward
                             # "getting closer", it doesn't replace the incentive to actually
                             # finish aiming.
-# 2026-09-04: added after the asymmetric REQUIRE_SUSTAINED_AIM_STEPS fix (see above) still
-# failed a full 2M-step trial -- reward/std looked healthy while the curriculum kept the
-# opponent weak (difficulty <0.5), then reward went back to flat-negative and std climbed
-# right back up (0.85->1.16) once difficulty ramped past 0.5. Hypothesis: SHAPING_SCALE pays
-# the exact same flat reward for a single on-target frame as for a held one, so there was no
-# gradient actually teaching the policy to hold aim through REQUIRE_SUSTAINED_AIM_STEPS --
-# only the terminal +-100 ever distinguished them, and that signal gets sparser as a sharper
-# opponent makes full engagements harder to complete. This adds reward that scales with how
-# far into the required streak the agent already is, on top of (not instead of) the existing
-# flat SHAPING_SCALE, so committing to a hold is visibly better every single step, not just
-# on the eventual payoff.
-STREAK_SHAPING_SCALE = 0.03
 # 2026-08-25: live testing also showed the bot never scoping in, even though a scoped
 # headshot deals 3-9x an unscoped body shot (MIN/MAX_HEADSHOT_DAMAGE vs
 # UNSCOPED_HIT_DAMAGE) -- the scripted opponent dies in ~3 unscoped body shots well within
@@ -316,10 +308,6 @@ class SniperDuelEnv(gym.Env):
         self._self_health = MAX_HEALTH
         self._opponent_health = MAX_HEALTH
 
-        # see REQUIRE_SUSTAINED_AIM_STEPS above
-        self._self_aim_streak = 0
-        self._opponent_aim_streak = 0
-
         self._step_count = 0
 
         # see OPPONENT_STYLES comment above -- picked fresh each episode so
@@ -392,34 +380,15 @@ class SniperDuelEnv(gym.Env):
         angle_diff = ((angle_to_target - shooter_angle + 180.0) % 360.0) - 180.0
         return abs(angle_diff) <= AIM_TOLERANCE_DEG
 
-    def _resolve_fire(self, aimed, aim_streak, shooter_scope_active, shooter_scope_charge, fire_signal, required_streak):
+    def _resolve_fire(self, aimed, shooter_scope_active, shooter_scope_charge, fire_signal):
         if fire_signal <= 0.0:
             return 0.0
         if not aimed:
             return 0.0
 
         if shooter_scope_active and shooter_scope_charge >= MIN_CHARGE_FOR_HEADSHOT:
-            # 2026-09-04: NOT gated on aim_streak -- see REQUIRE_SUSTAINED_AIM_STEPS
-            # above. A headshot already needs several steps of holding scope charge
-            # (MIN_CHARGE_FOR_HEADSHOT) before it can land at all, which is its own
-            # windup a fast spin can't fake; the original spin-and-spray exploit was
-            # entirely on UNSCOPED fire (zero windup of any kind). Two rounds of
-            # trials (N=3, then N=2, both asymmetric) gating headshots too still
-            # failed once the opponent curriculum reached full difficulty -- std
-            # never stopped climbing even given a full 1M held-difficulty steps to
-            # recover. Exempting headshots removes a redundant tax on the one shot
-            # type the agent most needs to stay competitive against a razor-sharp
-            # opponent, without reopening the exploit this was meant to close.
             charge_t = (shooter_scope_charge - MIN_CHARGE_FOR_HEADSHOT) / (1.0 - MIN_CHARGE_FOR_HEADSHOT)
             return MIN_HEADSHOT_DAMAGE + charge_t * (MAX_HEADSHOT_DAMAGE - MIN_HEADSHOT_DAMAGE)
-
-        # unscoped (or scoped-but-undercharged) fire has zero windup otherwise --
-        # see REQUIRE_SUSTAINED_AIM_STEPS above -- a single on-target frame is not
-        # enough to land this shot, closing the spin-and-spray exploit at its
-        # actual source. required_streak is 1 (i.e. no extra gate) for the
-        # scripted opponent's own shots -- see the step()-site comment for why.
-        if aim_streak < required_streak:
-            return 0.0
 
         return UNSCOPED_HIT_DAMAGE
 
@@ -502,61 +471,24 @@ class SniperDuelEnv(gym.Env):
             self._opponent_scope_active, self._opponent_scope_charge, opponent_action
         )
 
-        # sustained-aim tracking (see REQUIRE_SUSTAINED_AIM_STEPS) -- computed
-        # once here so both fire resolution and the reward block below (which
-        # used to recompute the same has_los/on_target checks independently)
-        # share a single, consistent source of truth per step.
-        #
-        # 2026-09-04: decays by 1 on a miss instead of hard-resetting to 0 --
-        # a control trial (gate fully removed) proved the gate itself, not
-        # difficulty or training pacing, was what destabilized training at
-        # high opponent difficulty (std climbed 0.9->1.3 with the hard-reset
-        # gate in three different variants, but stayed flat ~0.85-0.87 for
-        # the whole held-at-max-difficulty window with no gate at all). A
-        # hard reset punishes one bobbled frame while genuinely tracking a
-        # moving, shooting-back target exactly as hard as never having aimed
-        # at all, forcing a full rebuild from scratch -- against a
-        # difficulty=1.0 opponent (near-zero aim noise, fast turn-in) that's
-        # an unrealistic bar. Decay still can't be satisfied by a spin or a
-        # single flicker (off-frames dominate on-frames in both, so the
-        # streak nets toward 0 over time), but tolerates a single miss
-        # without erasing an otherwise-real hold. `aimed` (this frame) is
-        # still a separate hard requirement in _resolve_fire regardless of
-        # streak value, so this can't let a shot land while off-target.
+        # computed once here so both fire resolution and the reward block
+        # below (which used to recompute the same has_los/on_target checks
+        # independently) share a single, consistent source of truth per step.
         self_has_los = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
         self_aimed = self_has_los and self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
-        self._self_aim_streak = self._self_aim_streak + 1 if self_aimed else max(0, self._self_aim_streak - 1)
 
         opponent_has_los = self._line_of_sight_clear(self._opponent_pos, self._self_pos)
         opponent_aimed = opponent_has_los and self._is_on_target(self._opponent_pos, self._opponent_angle, self._self_pos)
-        self._opponent_aim_streak = self._opponent_aim_streak + 1 if opponent_aimed else max(0, self._opponent_aim_streak - 1)
 
-        # 2026-09-03: gating BOTH sides on REQUIRE_SUSTAINED_AIM_STEPS
-        # (validated via two 2M-step trials, N=3 and N=2) reintroduced the
-        # exact "avoid LOS entirely" passivity collapse this project already
-        # fought once -- ep_rew_mean stayed negative and std crept UP
-        # instead of shrinking in both trials. Root cause: the scripted
-        # opponent already tracks near-perfectly and holds position once
-        # locked on (see _scripted_opponent_action's on-target branch), so it
-        # builds its own streak easily even against an early, undertrained
-        # agent -- while the *agent* has to learn to hold still to ever
-        # build its own streak. That's an asymmetric nerf: engaging got
-        # riskier for the agent without getting any less dangerous from the
-        # opponent, undoing the "engaging clearly beats passivity" balance
-        # SHAPING_SCALE/STEP_PENALTY were tuned around. Only gating the
-        # agent's own shots leaves the opponent's threat model exactly as it
-        # was in the last known-stable config, closing the actual complained-
-        # about behavior (the agent's own spin-and-spray) without touching
-        # what wasn't broken.
         damage_to_opponent = self._resolve_fire(
-            self_aimed, self._self_aim_streak,
+            self_aimed,
             self._self_scope_active, self._self_scope_charge,
-            action[4], REQUIRE_SUSTAINED_AIM_STEPS,
+            action[4],
         )
         damage_to_self = self._resolve_fire(
-            opponent_aimed, self._opponent_aim_streak,
+            opponent_aimed,
             self._opponent_scope_active, self._opponent_scope_charge,
-            opponent_action[4], 1,
+            opponent_action[4],
         )
         self._opponent_health = max(0.0, self._opponent_health - damage_to_opponent)
         self._self_health = max(0.0, self._self_health - damage_to_self)
@@ -573,19 +505,14 @@ class SniperDuelEnv(gym.Env):
         elif self_dead:
             reward = -TERMINAL_REWARD
         else:
-            # reuse the has_los/aimed values computed above, alongside the
-            # aim-streak tracking -- require actual LOS, not just angle,
-            # otherwise "facing the opponent's raw bearing through a wall"
-            # farms the same reward as genuinely having them in your sights,
-            # with none of the risk.
+            # reuse the has_los/aimed values computed above -- require actual
+            # LOS, not just angle, otherwise "facing the opponent's raw
+            # bearing through a wall" farms the same reward as genuinely
+            # having them in your sights, with none of the risk.
             has_los = self_has_los
             aimed_at_opponent = self_aimed
             if aimed_at_opponent:
-                # see STREAK_SHAPING_SCALE above -- ramps 0 -> full across the
-                # first REQUIRE_SUSTAINED_AIM_STEPS frames of a held aim, on
-                # top of the flat SHAPING_SCALE every aimed frame already got.
-                streak_progress = min(self._self_aim_streak, REQUIRE_SUSTAINED_AIM_STEPS) / REQUIRE_SUSTAINED_AIM_STEPS
-                reward = SHAPING_SCALE + STREAK_SHAPING_SCALE * streak_progress
+                reward = SHAPING_SCALE
             elif has_los:
                 # partial credit for having a real sightline even before
                 # being aimed -- otherwise "blocked by cover" and "actively
