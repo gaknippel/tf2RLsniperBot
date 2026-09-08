@@ -108,15 +108,32 @@ MAX_HEADSHOT_DAMAGE = 450.0    # headshot damage at full (1.0) charge
 # plateauing there instead of shrinking, reward stuck negative throughout.
 # Also tried adding STREAK_SHAPING_SCALE (reward that ramps with streak
 # progress, see below) to rule out "no gradient toward holding aim" -- same
-# failure curve almost exactly, so that wasn't it either. Conclusion: holding
-# 3 consecutive on-target+LOS frames while a difficulty=1.0 scripted opponent
-# (near-zero aim noise, ~70%/frame fire chance once lined up, no sustained-aim
-# gate on ITS shots) shoots back is genuinely too hard to learn, independent
-# of training-time/pacing/shaping-gradient fixes. Dropped to 2 -- still blocks
-# the original single-frame spin exploit (a spin only sweeps across the
-# target for one frame per rotation, so back-to-back frames still forces an
-# actual stop) while roughly halving exposure time against the hardest
-# opponent. Re-validate before trusting this.
+# failure curve almost exactly, so that wasn't it either. Dropping to N=2
+# alone didn't help either (std climbed even further, to 1.28).
+#
+# 2026-09-04: root-caused via a control trial -- removing the gate entirely
+# (required_streak=1, i.e. the original exploit-open behavior) run through
+# the same held-at-difficulty-1.0 harness kept std FLAT (~0.85-0.87) the
+# whole window, proving the gate itself, not difficulty or curriculum
+# pacing, was what destabilized training. Root cause: a hard reset-to-0 on
+# any single missed frame punishes one bobble while genuinely tracking a
+# moving, shooting-back target exactly as hard as never having aimed at
+# all, forcing a full rebuild from scratch -- an unrealistic bar against a
+# difficulty=1.0 opponent (near-zero aim noise, fast turn-in, ~70%/frame
+# fire chance once lined up, no sustained-aim gate on ITS shots). Fixed by
+# changing the streak to DECAY by 1 on a miss instead of hard-resetting
+# (see the step()-site comment) -- still can't be satisfied by a spin or a
+# single flicker (off-frames dominate on-frames within one rotation, so the
+# streak nets toward 0 over time), but tolerates one missed frame without
+# erasing an otherwise-real hold. Combined with N=2 and the headshot
+# exemption below, this fully validated on a full 2M-step run through the
+# held-difficulty harness: std shrank smoothly 0.87->0.50 (vs. climbing to
+# 1.1-1.3 for every hard-reset variant, and better than even the ungated
+# control's flat 0.85-0.87), ep_rew_mean went net positive for most of the
+# back quarter of the run, and ep_len_mean dropped to ~270-284 (kills
+# actually happening), all while difficulty stayed pinned at the hardest
+# setting the whole time. This is the first variant of this fix that has
+# actually looked healthy end-to-end -- trusted for the real 50M-step run.
 REQUIRE_SUSTAINED_AIM_STEPS = 2
 
 TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shaping
