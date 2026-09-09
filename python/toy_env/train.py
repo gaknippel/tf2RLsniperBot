@@ -33,6 +33,7 @@ N_ENVS = 8  # matches this machine's logical core count
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "snapshots")
 FINAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_ppo")
+PRETRAINED_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_pretrained")
 TENSORBOARD_LOG_DIR = os.path.join(SCRIPT_DIR, "tb_logs")
 # timestamped so each script execution gets its own run folder -- SB3 reuses
 # the latest existing run folder for a given tb_log_name otherwise, which
@@ -99,7 +100,24 @@ def main():
     # (0.96 -> 0.53) with reward climbing to 80-98/100 by max difficulty --
     # no entropy bonus needed, and no runaway risk since there's nothing
     # pushing std up at all.
-    model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.0, tensorboard_log=TENSORBOARD_LOG_DIR)
+    # 2026-09-09: start from the behavior-cloned policy when one exists (see
+    # pretrain_policy.py). Winning here needs four things at once -- reach a
+    # sightline, aim, hold scope to charge, fire on the right tick -- and each
+    # only pays off once the others are in place, so from-scratch exploration
+    # has to find all of them together. Three separate 6M-step runs each
+    # converged on a different partial solution (scoped constantly but never
+    # took a sightline / took sightlines but stopped scoping / stopped firing
+    # entirely) and none ever won a game. Cloning the scripted expert first
+    # gives PPO a policy that already wins 80% at difficulty 0.0 and 48% at
+    # 0.5, so training refines a working strategy instead of gambling on
+    # discovering one.
+    if os.path.exists(PRETRAINED_PATH + ".zip"):
+        print(f"[train] warm-starting from {PRETRAINED_PATH}.zip")
+        model = PPO.load(PRETRAINED_PATH, env=vec_env, tensorboard_log=TENSORBOARD_LOG_DIR)
+        model.ent_coef = 0.0
+    else:
+        print("[train] no pretrained policy found, training from scratch")
+        model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.0, tensorboard_log=TENSORBOARD_LOG_DIR)
 
     callback = CallbackList([
         DifficultyCurriculumCallback(TOTAL_TIMESTEPS, update_freq=CHUNK_TIMESTEPS),

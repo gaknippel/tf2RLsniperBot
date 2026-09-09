@@ -70,6 +70,33 @@ FULL_CHARGE_STEPS = 30  # steps of holding scope to reach full (1.0) charge
 MAX_HEALTH = 125.0  # TF2 Sniper base health
 AIM_TOLERANCE_DEG = 5.0  # target must be within this many degrees of facing to be hit
 
+# 2026-09-09: THE core mechanic that was missing, and the reason spin-and-spray
+# was viable at all. Until now either side could fire on EVERY tick -- there is
+# no ammo limit here, so "hold the trigger down forever" was legal. TF2's real
+# Sniper Rifle has ~1.5s of refire time, which at this env's step rate
+# (EPISODE_DURATION 20s / MAX_EPISODE_STEPS 300 = 0.067 s/step) is ~22 steps.
+# So the sim was permitting something physically impossible in the deployment
+# target -- a sim-to-real mismatch, not just a balance quirk.
+#
+# That mismatch is what made the exploit pay: sweeping a crosshair across the
+# target while firing every tick lands roughly 8 hits per episode (on-target is
+# ~10 of 360 degrees, ~2.8% of ticks, over 300 ticks) when only 3 body shots
+# are needed to kill. With a real cooldown the same spin gets ~13 shots at
+# ~2.8% blind hit chance -- about 0.4 expected hits, i.e. useless -- while
+# actually aiming gets 3 aimed shots and a kill. The exploit dies on economics,
+# with no need to forbid the agent from turning.
+#
+# Crucially this is applied SYMMETRICALLY. Every previous attempt to kill the
+# exploit constrained only the agent's fire, which made engaging strictly
+# riskier for it while the opponent stayed unconstrained -- and at high
+# difficulty that flipped engagement to negative expected value and collapsed
+# the policy into never taking line of sight at all (confirmed behaviorally:
+# 0.0% LOS, 0% fire rate, 60/60 timeouts). A symmetric cooldown instead cuts
+# the scripted opponent's damage output hard (from up to ~0.7 shots/tick once
+# lined up down to one shot per cooldown), which relieves that pressure rather
+# than adding to it.
+FIRE_COOLDOWN_STEPS = 22
+
 MIN_CHARGE_FOR_HEADSHOT = 0.1  # ~3 steps of scoping before a headshot can register
 UNSCOPED_HIT_DAMAGE = 50.0     # flat body-shot damage: unscoped, or scoped but under-charged
 MIN_HEADSHOT_DAMAGE = 150.0    # headshot damage at MIN_CHARGE_FOR_HEADSHOT
@@ -129,16 +156,46 @@ MAX_HEADSHOT_DAMAGE = 450.0    # headshot damage at full (1.0) charge
 # just as hard as the others -- strong evidence the complexity of the gate
 # was never the actual problem, just any bar placed on it at all.
 #
-# Given that, the fire-resolution mechanic below is being left exactly as it
-# was before any of this -- proven stable through the full realistic
-# curriculum -- and the actual fix for the spin-and-spray behavior belongs at
-# the deployment layer instead, mirroring how the blind-fire issue was
-# already solved that way (see MISS_PENALTY's comment below): gate the real
-# fire button in tf_sniper_bot.cpp's ApplyAction on the bot's actual in-engine
-# angular velocity at the moment of firing, the same way it's already gated
-# on the engine's real FVisible() check. That enforces "don't fire while
-# spinning" deterministically on the trained policy's output, without asking
-# training itself to solve a problem it has now failed four different ways.
+# 2026-09-09: the above conclusion was WRONG, and the way it was reached is
+# worth recording. "Revert the gate, fix it at the deployment layer" was
+# validated on std/ep_rew_mean/ep_len_mean only -- never on what the policy
+# actually DID. A behavioral probe of the resulting 50M-step policy (see
+# scratchpad probe_behavior.py) found textbook spin-and-spray: yaw sweeping
+# monotonically without ever settling, fire held on 100% of ticks, mean aim
+# error 94 deg, on-target just 2.4% of ticks. The ungated run's smooth,
+# fast-shrinking std was never "healthy training" -- it was rapid, clean
+# convergence onto the exploit, which genuinely IS near-optimal when a single
+# on-target frame is enough to land a shot. That also flips the read on the
+# gated runs: their climbing std was more likely a policy still searching
+# under a hard, sparse reward, not broken training dynamics. This is the same
+# mistake as the original 600/600 eval that hid this behavior in the first
+# place -- judging by aggregate metrics that a degenerate policy scores well
+# on. Any verdict here needs the behavioral probe, not just the curves.
+#
+# It also sinks the deployment-layer plan on its own terms: with the policy
+# spinning on essentially every tick (|turn| < 0.35 on 0.0% of them), a
+# turn-rate gate in tf_sniper_bot.cpp suppresses 100% of its shots -- the bot
+# would never fire at all. A deployment gate can only clean up behavior the
+# policy already exhibits sometimes; it cannot create it.
+#
+# 2026-09-09, final: tried one more gate (instantaneous turn-rate) together
+# with the dense ALIGN_SHAPING_SCALE slope described below, on the theory that
+# the gates had failed only for lack of a learnable gradient. It failed too,
+# and the behavioral probe showed the OTHER failure mode this project knows
+# well: the agent stopped spinning (|turn| median 0.267, under the gate) but
+# answered "you must hold still to shoot" with "then I never engage" -- 0.0%
+# of ticks with line of sight, 0% fire rate, 60/60 timeouts, zero kills either
+# way. That is the documented passivity floor, and it makes the mechanism
+# behind all five gate attempts concrete: gating only the AGENT's fire, while
+# the scripted opponent shoots freely, means engaging costs the agent more
+# exactly as the opponent grows more lethal, until hiding is simply the better
+# play. The gate was never the wrong idea in isolation -- the ASYMMETRY was.
+#
+# So: no gate on the agent at all. FIRE_COOLDOWN_STEPS (see above) removes the
+# exploit's payoff symmetrically instead, by fixing the underlying sim-to-real
+# bug that made spamming fire legal in the first place. The dense alignment
+# slope below stays, since aiming now genuinely pays and the policy needs a
+# gradient to learn it.
 
 TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shaping
 # 2026-08-25: raised SHAPING_SCALE/LOS_SHAPING_SCALE ~5x (were 0.01/0.003) after two
@@ -152,9 +209,18 @@ TERMINAL_REWARD = 100.0  # magnitude of the win/loss reward, must dominate shapi
 # clear win (+0.047/step), while staying tiny next to TERMINAL_REWARD=100 for the
 # actual win/loss decision (0.05 * 300 = 15, well under 100).
 SHAPING_SCALE = 0.05     # per-step reward for being aimed at the opponent (with LOS)
-MISS_PENALTY = 0.02      # small per-shot cost when firing lands no damage -- discourages
-                          # constant spam-fire (the toy env has no ammo limit, so without
-                          # this a policy has zero incentive to hold fire until actually aimed)
+# 2026-09-09: was 0.02, a per-shot cost for firing without landing damage. Its
+# stated purpose was to discourage constant spam-fire, "the toy env has no ammo
+# limit, so without this a policy has zero incentive to hold fire until actually
+# aimed" -- which FIRE_COOLDOWN_STEPS now enforces directly and much better. Left
+# at 0.02 alongside the cooldown it became actively harmful: the cooldown cuts
+# shots per episode from 300 to ~13, so positive reinforcement for "firing
+# sometimes connects" got ~23x sparser, while this penalty stayed immediate and
+# certain. A 6M-step trial with both active learned the obvious response and
+# stopped firing altogether -- trigger pulled on 0.0% of ticks at every
+# difficulty, zero shots, zero wins. Zeroed out rather than deleted so the
+# reasoning stays attached to the knob if anyone reaches for it again.
+MISS_PENALTY = 0.0
 # 2026-08-25: tried splitting this into a heavier BLIND_FIRE_PENALTY for firing with no LOS
 # at all, after live in-game testing showed the bot holding the fire button constantly
 # including through cover. Reverted -- even a mild 1.5x delta (0.03 vs 0.02) reproduced the
@@ -182,6 +248,61 @@ LOS_SHAPING_SCALE = 0.02  # reward for LOS alone, independent of being on-target
                             # together) is worth more, so this only adds a gradient toward
                             # "getting closer", it doesn't replace the incentive to actually
                             # finish aiming.
+
+# 2026-09-09: the missing piece behind every failed attempt at gating fire.
+# Until now the aim reward was BINARY: SHAPING_SCALE the instant |aim error|
+# fell under AIM_TOLERANCE_DEG (5 deg), LOS_SHAPING_SCALE otherwise. Going
+# from 94 deg of error to 10 deg earned exactly zero extra reward, so with a
+# fire gate active the policy had no gradient telling it it was getting
+# warmer -- it had to randomly stumble into a 10-deg-wide window out of a
+# full 360 to get any signal at all. That needle-in-a-haystack search, not
+# "gates break PPO", is the far better explanation for why four different
+# fire gates all failed to converge: they made the cheap exploit unavailable
+# without ever making real aiming *learnable*.
+#
+# This adds a dense term that grows smoothly as aim error shrinks, scaled
+# from 0 at ALIGN_SHAPING_MAX_ERROR_DEG of error up to its full value at
+# perfectly on-target, and only paid while LOS is clear (same reasoning as
+# LOS_SHAPING_SCALE -- don't pay for lining up on a wall). Deliberately kept
+# smaller than SHAPING_SCALE so actually reaching on-target still dominates;
+# this only supplies the slope leading there.
+#
+# Worth distinguishing from the two reward additions this file already
+# records as failures (BLIND_FIRE_PENALTY, SCOPE_CHARGE_SHAPING_SCALE): both
+# of those added *cost or risk* to engaging, which is what tipped training
+# back into the passivity floor. This adds gradient toward the objective and
+# no new downside, which is the standard fix for exactly this sparse-binary
+# -reward problem.
+ALIGN_SHAPING_SCALE = 0.03
+ALIGN_SHAPING_MAX_ERROR_DEG = 90.0  # aim error at/above which the dense term pays 0
+
+# 2026-09-09: paid per step for holding scope while genuinely lined up, ramping
+# with charge up to MIN_CHARGE_FOR_HEADSHOT.
+#
+# With FIRE_COOLDOWN_STEPS in place, scoping stopped being optional and became
+# the only strategy that actually wins. Measured on this map, hand-written
+# strategies over 60 episodes on identical seeds:
+#
+#   stand + unscoped body shots : 27W/19L (diff 0), 9W/12L (0.5), 0W/5L (1.0)
+#   scope + charged headshot    : 59W/0L  (diff 0), 26W/0L  (0.5), 7W/0L  (1.0)
+#
+# The body-shot line can't win at high difficulty at all: line of sight is only
+# available ~6% of ticks there, and three cooldown-spaced body shots need 45+
+# steps of it. A charged headshot deals 150-450 against 125 max health, so it
+# one-shots from a single LOS window -- which is what a cover-heavy map like
+# this actually offers. Note the scoped line takes ZERO losses at every
+# difficulty; it kills before the opponent can stack up three body shots.
+#
+# This file already records an abandoned SCOPE_CHARGE_SHAPING_SCALE=0.03 from
+# 2026-08-25 that caused a passivity collapse, reasoned as "lingering in the
+# aimed+LOS state to build charge also means lingering exposed to the
+# opponent's return fire". That objection was correct then and is obsolete
+# now: back then fire had no cooldown, so lingering meant absorbing up to one
+# opponent shot per tick, and body-shot spam was good enough that scoping was
+# a pure cost. With the cooldown the opponent fires at most once per
+# FIRE_COOLDOWN_STEPS, and scoping is the winning line rather than a detour --
+# so this reward now points at the true optimum instead of away from it.
+SCOPE_SHAPING_SCALE = 0.04
 # 2026-08-25: live testing also showed the bot never scoping in, even though a scoped
 # headshot deals 3-9x an unscoped body shot (MIN/MAX_HEADSHOT_DAMAGE vs
 # UNSCOPED_HIT_DAMAGE) -- the scripted opponent dies in ~3 unscoped body shots well within
@@ -225,6 +346,29 @@ OPPONENT_ENGAGE_RANGE = 250.0  # scripted opponent closes distance until within 
 # the scripted opponent's whole approach style per episode forces the policy to learn to
 # hunt/reposition on its own instead of just reacting to a predictable approach pattern.
 OPPONENT_STYLES = ("aggressive", "camper", "retreater")
+
+# 2026-09-09: floor on how often an episode still starts on the clear-sightline
+# spawn (EASY_SPAWN_Y), no matter how high difficulty has climbed. See reset().
+#
+# The old scheme interpolated the spawn y coordinate itself --
+# spawn_y = EASY_SPAWN_Y * (1 - difficulty) -- intending a smooth blend from
+# "guaranteed line of sight" to "the real, cover-blocked spawn line". In
+# practice the map geometry turns that into a cliff, not a blend: the middle
+# crate's top edge is at y=109, so the sightline is clear only while
+# spawn_y > 109, i.e. difficulty < ~0.13. Measured directly, LOS at spawn goes
+# 100% at difficulty 0.00 -> 0% by difficulty 0.25 and stays at 0% forever
+# after. So the agent gets a reliable engagement signal for the first ~13% of
+# training and then never sees one again, which extinguishes whatever it had
+# learned and leaves nothing to relearn from -- a very good candidate for the
+# "never get LOS" passivity floor this file keeps rediscovering.
+#
+# Mixing whole episodes instead of interpolating a coordinate gives a curriculum
+# that is actually gradual in the thing that matters (how often engaging is
+# even possible), and the floor guarantees the signal never disappears
+# entirely: even at difficulty 1.0 this fraction of episodes still start with a
+# clear shot, so "engage" stays reinforced while the rest of the episodes teach
+# fighting from the real cover-blocked spawns.
+MIN_EASY_SPAWN_FRACTION = 0.15
 
 
 class SniperDuelEnv(gym.Env):
@@ -279,15 +423,33 @@ class SniperDuelEnv(gym.Env):
         # needed to earn *any* shaping reward, regardless of its magnitude.
         # EASY_SPAWN_Y sits in the one confirmed-clear horizontal gap
         # between the crate's top (y=109) and the lower pillars' bottom
-        # (y=144.667) -- at difficulty=0 both spawns sit on it, so the agent
-        # can learn "see it, aim, shoot" while stationary, before difficulty
-        # blends the spawn back down to the real (cover-blocked) line, by
-        # which point engaging is already a learned habit worth navigating
-        # cover to keep doing. Y jitter scales in alongside the blend so an
-        # easy-mode reset doesn't occasionally jitter back into the crate's
-        # shadow.
-        spawn_y = EASY_SPAWN_Y * (1.0 - self.difficulty)
-        y_jitter = SPAWN_JITTER * self.difficulty
+        # (y=144.667), so an episode starting there has a clear shot the full
+        # width of the arena and the agent can learn "see it, aim, shoot"
+        # while stationary.
+        #
+        # 2026-09-09: this used to interpolate the coordinate itself
+        # (spawn_y = EASY_SPAWN_Y * (1 - difficulty)), which reads like a
+        # smooth blend but isn't one -- the crate's top edge at y=109 means
+        # the sightline is clear only while spawn_y > 109, i.e. difficulty
+        # below ~0.13. Measured, LOS at spawn was 100% at difficulty 0.00 and
+        # already 0% by 0.25, staying there for the rest of the run. Now the
+        # curriculum mixes whole episodes instead: each reset independently
+        # picks the easy line or the real one, with the easy share falling
+        # from 1.0 to MIN_EASY_SPAWN_FRACTION as difficulty climbs. That makes
+        # the ramp gradual in the quantity that actually matters -- how often
+        # engaging is possible at all -- and the floor keeps the signal alive
+        # instead of switching it off entirely partway through training.
+        easy_fraction = max(MIN_EASY_SPAWN_FRACTION, 1.0 - self.difficulty)
+        easy_spawn = self.np_random.uniform() < easy_fraction
+
+        if easy_spawn:
+            # jitter stays small here so an easy reset can't land in the
+            # crate's shadow and quietly stop being an easy reset.
+            spawn_y = EASY_SPAWN_Y
+            y_jitter = SPAWN_JITTER * 0.25
+        else:
+            spawn_y = 0.0  # the real RED/BLU spawn line
+            y_jitter = SPAWN_JITTER
 
         self._self_pos = np.array([SELF_SPAWN[0], spawn_y], dtype=np.float32)
         self._self_pos[0] += self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER)
@@ -308,11 +470,33 @@ class SniperDuelEnv(gym.Env):
         self._self_health = MAX_HEALTH
         self._opponent_health = MAX_HEALTH
 
+        # see FIRE_COOLDOWN_STEPS -- both start ready to fire
+        self._self_fire_cooldown = 0
+        self._opponent_fire_cooldown = 0
+
         self._step_count = 0
 
         # see OPPONENT_STYLES comment above -- picked fresh each episode so
         # training sees a genuine mix of approach patterns, not one habit.
         self._opponent_style = self.np_random.choice(OPPONENT_STYLES)
+
+        # 2026-09-09: whether this opponent scopes at all, decided per episode
+        # so scope charge can build consistently within one.
+        #
+        # The difficulty curriculum scaled the opponent's aim noise, turn rate
+        # and fire chance, but never its scoping -- so even at difficulty 0.0
+        # it was a headshotting sniper, and a charged headshot (150-450) one-
+        # shots a 125 HP target. Measured against an agent standing still in
+        # the open, the difficulty-0.0 "easy on-ramp" opponent killed it in 31
+        # of 60 episodes in ~70 steps, landing more headshots (30) than body
+        # shots (18). That leaves no phase of training where engaging is
+        # survivable while the agent is still learning to aim, which is the
+        # bootstrap trap behind the passivity collapses: die instantly on
+        # contact, learn to avoid contact, never learn to fight. Ramping scope
+        # use with difficulty restores what the curriculum was supposed to
+        # provide -- an early opponent that can only body-shot, needing three
+        # hits and giving the agent room to make mistakes and still learn.
+        self._opponent_uses_scope = self.np_random.uniform() < self.difficulty
 
         observation = self._get_obs()
         info = {}
@@ -374,13 +558,18 @@ class SniperDuelEnv(gym.Env):
 
         return True
 
-    def _is_on_target(self, shooter_pos, shooter_angle, target_pos):
+    def _aim_error_deg(self, shooter_pos, shooter_angle, target_pos):
         to_target = target_pos - shooter_pos
         angle_to_target = np.degrees(np.arctan2(to_target[1], to_target[0]))
         angle_diff = ((angle_to_target - shooter_angle + 180.0) % 360.0) - 180.0
-        return abs(angle_diff) <= AIM_TOLERANCE_DEG
+        return abs(angle_diff)
+
+    def _is_on_target(self, shooter_pos, shooter_angle, target_pos):
+        return self._aim_error_deg(shooter_pos, shooter_angle, target_pos) <= AIM_TOLERANCE_DEG
 
     def _resolve_fire(self, aimed, shooter_scope_active, shooter_scope_charge, fire_signal):
+        """Damage dealt this step. Callers must check/clear the shooter's own
+        cooldown -- see _try_fire, which owns that bookkeeping for both sides."""
         if fire_signal <= 0.0:
             return 0.0
         if not aimed:
@@ -391,6 +580,33 @@ class SniperDuelEnv(gym.Env):
             return MIN_HEADSHOT_DAMAGE + charge_t * (MAX_HEADSHOT_DAMAGE - MIN_HEADSHOT_DAMAGE)
 
         return UNSCOPED_HIT_DAMAGE
+
+    def _try_fire(self, cooldown, aimed, scope_active, scope_charge, fire_signal):
+        """Resolve one side's shot subject to FIRE_COOLDOWN_STEPS.
+
+        Returns (damage, new_cooldown, shot_taken). The cooldown only resets
+        when a shot is actually taken (trigger pulled while off cooldown) --
+        holding the trigger down through the cooldown doesn't stack up extra
+        shots, and a shot that's taken but misses still spends the cooldown,
+        so blind firing costs real opportunity instead of being free.
+
+        shot_taken is what MISS_PENALTY keys off, so that holding the trigger
+        during cooldown -- which the game simply ignores -- isn't punished. The
+        agent has no cooldown field in its observation (deliberately: the real
+        weapon in tf_sniper_bot.cpp handles refire itself while the bot just
+        holds +attack, so this matches deployment), and penalizing every
+        ignored trigger tick would have forced it to time shots blind.
+        """
+        if cooldown > 0:
+            return 0.0, cooldown - 1, False
+        if fire_signal <= 0.0:
+            return 0.0, 0, False
+
+        damage = self._resolve_fire(aimed, scope_active, scope_charge, fire_signal)
+        # -1 so the shot-to-shot cadence is exactly FIRE_COOLDOWN_STEPS: this
+        # tick fires, the next FIRE_COOLDOWN_STEPS-1 ticks tick the counter
+        # down, and the one after that is free to fire again.
+        return damage, FIRE_COOLDOWN_STEPS - 1, True
 
     def _scripted_opponent_action(self):
         # hand-authored BLU opponent, not a learned policy -- see the
@@ -439,7 +655,11 @@ class SniperDuelEnv(gym.Env):
                 # out.
                 fwd = -1.0 if distance < OPPONENT_ENGAGE_RANGE else 0.0
 
-        want_scope = 1.0 if (has_los and abs(angle_diff) <= AIM_TOLERANCE_DEG * 2.0) else -1.0
+        # see _opponent_uses_scope in reset() -- scoping ramps in with
+        # difficulty rather than being on from the very first training step.
+        want_scope = 1.0 if (self._opponent_uses_scope
+                             and has_los
+                             and abs(angle_diff) <= AIM_TOLERANCE_DEG * 2.0) else -1.0
 
         # quadratic, not linear, in difficulty -- at difficulty=0 this was
         # 0.3 (still real lethality on day one of training), which combined
@@ -475,20 +695,21 @@ class SniperDuelEnv(gym.Env):
         # below (which used to recompute the same has_los/on_target checks
         # independently) share a single, consistent source of truth per step.
         self_has_los = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
-        self_aimed = self_has_los and self._is_on_target(self._self_pos, self._self_angle, self._opponent_pos)
+        self_aim_error = self._aim_error_deg(self._self_pos, self._self_angle, self._opponent_pos)
+        self_aimed = self_has_los and self_aim_error <= AIM_TOLERANCE_DEG
 
         opponent_has_los = self._line_of_sight_clear(self._opponent_pos, self._self_pos)
         opponent_aimed = opponent_has_los and self._is_on_target(self._opponent_pos, self._opponent_angle, self._self_pos)
 
-        damage_to_opponent = self._resolve_fire(
-            self_aimed,
-            self._self_scope_active, self._self_scope_charge,
-            action[4],
+        # symmetric -- both sides pay the same FIRE_COOLDOWN_STEPS. See its
+        # comment above for why symmetry is the whole point here.
+        damage_to_opponent, self._self_fire_cooldown, self_shot_taken = self._try_fire(
+            self._self_fire_cooldown, self_aimed,
+            self._self_scope_active, self._self_scope_charge, action[4],
         )
-        damage_to_self = self._resolve_fire(
-            opponent_aimed,
-            self._opponent_scope_active, self._opponent_scope_charge,
-            opponent_action[4],
+        damage_to_self, self._opponent_fire_cooldown, _ = self._try_fire(
+            self._opponent_fire_cooldown, opponent_aimed,
+            self._opponent_scope_active, self._opponent_scope_charge, opponent_action[4],
         )
         self._opponent_health = max(0.0, self._opponent_health - damage_to_opponent)
         self._self_health = max(0.0, self._self_health - damage_to_self)
@@ -522,9 +743,37 @@ class SniperDuelEnv(gym.Env):
             else:
                 reward = 0.0
 
-            # discourage constant spam-fire -- the env has no ammo limit, so
-            # without a cost the policy has no reason to ever hold fire.
-            if action[4] > 0.0 and damage_to_opponent <= 0.0:
+            # see ALIGN_SHAPING_SCALE -- dense slope toward being on-target,
+            # so closing from 94 deg of aim error to 10 deg is visibly better
+            # than not, instead of paying nothing until the 5-deg window is
+            # hit exactly. LOS-gated for the same reason as LOS_SHAPING_SCALE:
+            # lining up on a wall shouldn't pay.
+            if has_los:
+                align_t = 1.0 - min(self_aim_error, ALIGN_SHAPING_MAX_ERROR_DEG) / ALIGN_SHAPING_MAX_ERROR_DEG
+                reward += ALIGN_SHAPING_SCALE * align_t
+
+            # see SCOPE_SHAPING_SCALE -- pays for charging a scope while a
+            # sightline is open, which is the one line that reliably wins on
+            # this map.
+            #
+            # 2026-09-09: gated on has_los rather than on being aimed. Gating
+            # it on aim created a chicken-and-egg the policy could not cross:
+            # the bonus only paid once already lined up, so a policy that had
+            # not yet learned to engage never experienced it and never learned
+            # that scoping is what makes engaging pay. Measured across two
+            # otherwise-identical runs, one found scoping (99.6% of ticks) and
+            # one never did (13.8% at 1M steps, decaying to 0) -- pure
+            # exploration luck on a skill that should not need luck. LOS is
+            # still required so this cannot be farmed while hiding behind
+            # cover, which is what keeps the anti-passivity pressure intact.
+            if has_los and self._self_scope_active:
+                charge_t = min(self._self_scope_charge, MIN_CHARGE_FOR_HEADSHOT) / MIN_CHARGE_FOR_HEADSHOT
+                reward += SCOPE_SHAPING_SCALE * charge_t
+
+            # cost a shot that was actually taken and missed. Keyed on
+            # self_shot_taken, not the raw trigger, so trigger ticks the
+            # cooldown swallowed aren't punished -- see _try_fire.
+            if self_shot_taken and damage_to_opponent <= 0.0:
                 reward -= MISS_PENALTY
 
             # discourage riding out the clock -- passivity would otherwise
