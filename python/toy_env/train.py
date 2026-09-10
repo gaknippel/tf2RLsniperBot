@@ -3,6 +3,7 @@ import time
 
 from stable_baselines3 import PPO
 from stable_baselines3.common.callbacks import BaseCallback, CallbackList, CheckpointCallback
+from stable_baselines3.common.logger import configure
 from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import SubprocVecEnv
 
@@ -115,6 +116,11 @@ def main():
         print(f"[train] warm-starting from {PRETRAINED_PATH}.zip")
         model = PPO.load(PRETRAINED_PATH, env=vec_env, tensorboard_log=TENSORBOARD_LOG_DIR)
         model.ent_coef = 0.0
+        # PPO.load restores verbose from the saved model, and pretrain_policy.py
+        # builds its throwaway model with verbose=0 -- without this the whole
+        # run prints curriculum lines and no rollout/train tables at all.
+        model.verbose = 1
+        model.set_logger(configure(None, ["stdout"]))
     else:
         print("[train] no pretrained policy found, training from scratch")
         model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.0, tensorboard_log=TENSORBOARD_LOG_DIR)

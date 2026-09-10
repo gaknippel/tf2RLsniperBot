@@ -157,6 +157,22 @@ def verdict(rows):
             "PASSIVITY: episodes run to the timeout with almost no wins -- "
             "policy is riding out the clock")
 
+    # 2026-09-10: added after this returned PASS on a policy that won 0% at
+    # every difficulty with a 0% hit rate. The two signature checks above look
+    # for specific collapse shapes and a thoroughly broken policy can slip
+    # between them -- it fired occasionally (so not "never fires"), held some
+    # line of sight (so not strictly passive) and didn't spin, while being
+    # completely ineffective. Effectiveness is worth asserting directly rather
+    # than inferring from behavior fingerprints.
+    if all(r["win_rate"] < 0.05 for r in rows):
+        problems.append(
+            "INEFFECTIVE: wins < 5% at EVERY difficulty, including the easiest "
+            "-- whatever it is doing, it does not work")
+    if all(r["hit_rate"] < 10.0 for r in rows):
+        problems.append(
+            "INEFFECTIVE: hit rate < 10% at every difficulty -- shots are not "
+            "connecting, so aim is broken regardless of the other stats")
+
     return problems
 
 
