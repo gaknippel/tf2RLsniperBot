@@ -34,6 +34,67 @@
 static const float TURN_RATE_DEG_PER_SEC = 300.0f;
 static const float EPISODE_DURATION_SECONDS = 20.0f;
 
+// 2026-09-10: aiming is computed here analytically instead of being taken from
+// the policy's turn output, and firing is gated on actually being on target.
+//
+// Aiming is not a learning problem -- it is one line of trigonometry, exact at
+// every position on the map. Training a network to approximate atan2 from
+// sampled states went badly across two full 50M-step runs: the first learned no
+// aiming at all (it always spawned facing the opponent, so "drift one way and
+// fire when the target crosses the crosshair" scored a 98% in-sim hit rate
+// while sitting 73 degrees off target in game), and even a policy cloned
+// directly from a perfect analytic expert only turned the right way in ~65% of
+// swept aim errors, because a 2D toy env cannot cover the state space the real
+// game presents.
+//
+// So the split is now: the bridge owns aim (exact, from live engine geometry,
+// with tunable imperfection below so it stays beatable), and the policy owns
+// the decisions that genuinely need learning and have no closed form --
+// positioning, when to push or hold, when to break line of sight, when to take
+// the shot. That also removes the sim-to-real aiming gap permanently, since aim
+// no longer depends on anything the toy env approximated.
+//
+// AIM_* knobs exist so this is a fightable opponent rather than a literal
+// aimbot, and they are far easier to tune for feel than hoping PPO lands
+// somewhere fun:
+//   SLEW            - max degrees/sec the view can swing, so it cannot teleport
+//                     onto a target; lower feels more human.
+//   ERROR_UNITS     - how far off the aim point it settles, measured in world
+//                     units AT THE TARGET, re-rolled per target acquisition.
+//   SETTLE_UNITS    - how close counts as "on target" for the fire gate, also
+//                     in world units at the target.
+//   MIN_CHARGE      - scope charge required before taking a shot. NOT about
+//                     damage: an UNCHARGED headshot already does
+//                     TF_WEAPON_SNIPERRIFLE_DAMAGE_MIN (50) x3 = 150, which
+//                     outright kills a 125 HP sniper, so waiting for a full
+//                     charge buys nothing and just makes the bot passive. This
+//                     exists only to clear the engine's headshot rules in
+//                     CTFSniperRifle::CanFireCriticalShot(): crits need the
+//                     scope up AND at least
+//                     TF_WEAPON_SNIPERRIFLE_NO_CRIT_AFTER_ZOOM_TIME (0.2s)
+//                     since the zoom began. Charge rises at
+//                     CHARGE_PER_SEC (50) toward DAMAGE_MAX (150), so charge
+//                     fraction == seconds_zoomed / 3 -- meaning 0.2s is only
+//                     0.067. 0.15 is ~0.45s, a comfortable margin past the
+//                     window while still shooting ~6x sooner than a full
+//                     charge would. (Full charge is only actually required for
+//                     weapons carrying the sniper_no_headshot_without_full_charge
+//                     attribute, i.e. the Machina -- not a stock rifle.)
+//
+// 2026-09-10: ERROR and SETTLE are deliberately expressed in world units
+// rather than degrees. They were degrees first (2.0 and 3.5), which looks
+// reasonable but is distance-blind: a player is only ~49 units wide, so at 1000
+// units their half-width subtends about 1.4 degrees. A fixed 2-degree offset is
+// therefore a guaranteed miss at range while being harmless up close, which is
+// exactly what live testing showed -- the bot tracked well and still landed
+// "pixels off" at distance. Converting a linear tolerance into an angle per
+// tick (atan(units / distance)) makes it tight at long range and forgiving
+// close up, which is both more accurate and more human.
+static const float AIM_SLEW_DEG_PER_SEC = 220.0f;
+static const float AIM_ERROR_UNITS = 6.0f;
+static const float AIM_SETTLE_UNITS = 14.0f;
+static const float AIM_MIN_CHARGE_TO_FIRE = 0.15f;
+
 // Must match sniper_duel_env.py's POSITION_LOW/POSITION_HIGH exactly -- see
 // that file's comment for the full derivation. Surveyed from the compiled
 // map's actual wall brushes (inner faces at x=-639/647, y=-479/459) minus a
@@ -51,6 +112,10 @@ struct SniperBotSlot_t
 	CHandle<CTFPlayer> hBot;
 	float flAliveSince;   // gpGlobals->curtime this life started, for the time_left approximation
 	bool bWasAlive;
+	// see the AIM_* constants -- a per-acquisition aim offset, re-rolled each
+	// time the bot reacquires a target, so it doesn't settle pixel-perfect.
+	float flAimErrorOffsetUnits;
+	bool bHadTargetLastTick;
 };
 
 static SniperBotSlot_t g_SniperBot; // RED only -- see the file-header comment.
@@ -116,6 +181,9 @@ void SniperBot_SpawnSolo()
 	}
 	g_SniperBot.flAliveSince = gpGlobals->curtime;
 	g_SniperBot.bWasAlive = true;
+	// fresh life, fresh aim state -- see the AIM_* constants
+	g_SniperBot.bHadTargetLastTick = false;
+	g_SniperBot.flAimErrorOffsetUnits = 0.0f;
 }
 
 void SniperBot_RemoveDuel()
@@ -147,12 +215,46 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 	float flTimeLeft = 1.0f - ( ( gpGlobals->curtime - flAliveSince ) / EPISODE_DURATION_SECONDS );
 	flTimeLeft = clamp( flTimeLeft, 0.0f, 1.0f );
 
+	// 2026-09-10: egocentric aim error, added after the previous policy turned
+	// out never to have learned to aim -- see sniper_duel_env.py's
+	// aim_error_sin/cos comment. Signed error between where the bot faces and
+	// the true bearing to its opponent, so positive always means "turn
+	// positive to correct" regardless of where either of them is standing.
+	// Zeroed without visibility, matching opponent_pos, so the bot gets no aim
+	// cue through a wall. Must stay numerically identical to the Python
+	// _get_obs computation or the policy is reading a different quantity than
+	// it trained on.
+	float flAimErrorSin = 0.0f;
+	float flAimErrorCos = 0.0f;
+	if ( bOpponentVisible )
+	{
+		float flBearing = RAD2DEG( atan2f( vecOpponent.y - vecSelf.y, vecOpponent.x - vecSelf.x ) );
+		float flErr = AngleNormalize( flBearing - flYaw );
+		flAimErrorSin = sinf( DEG2RAD( flErr ) );
+		flAimErrorCos = cosf( DEG2RAD( flErr ) );
+	}
+
+	// NOTE: this order is gymnasium.spaces.Dict's alphabetical key order, NOT
+	// the declaration order in SniperDuelEnv -- it must match export_policy.py's
+	// OBS_KEY_ORDER exactly. The aim_error_* keys sort to the FRONT, which
+	// shifts every field that follows them.
 	int i = 0;
+	obs[i++] = flAimErrorCos;
+	obs[i++] = flAimErrorSin;
 	obs[i++] = bOpponentVisible ? vecOpponent.x : 0.0f;
 	obs[i++] = bOpponentVisible ? vecOpponent.y : 0.0f;
 	obs[i++] = bOpponentVisible ? 1.0f : 0.0f;
 	obs[i++] = ( pRifle && pRifle->IsZoomed() ) ? 1.0f : 0.0f;
-	obs[i++] = pRifle ? pRifle->GetProgress() : 0.0f;
+	// 2026-09-10: was pRifle->GetProgress(), which is NOT the scope charge --
+	// CTFSniperRifle::GetProgress() returns GetRageMeter()/100, the Hitman's
+	// Heatmaker rage meter, which is always 0 on a stock rifle. So this
+	// observation fed the policy a constant 0 for its entire training-to-
+	// deployment life, and live debug showed scope_charge pinned at 0.00 every
+	// tick while the bot was demonstrably zoomed. GetScopeChargePerc() is the
+	// real thing: m_flChargedDamage / TF_WEAPON_SNIPERRIFLE_DAMAGE_MAX, i.e.
+	// 0..1. It was added to tf_weapon_sniperrifle.h for this -- the equivalent
+	// GetHUDDamagePerc() exists but is CLIENT_DLL only.
+	obs[i++] = pRifle ? pRifle->GetScopeChargePerc() : 0.0f;
 	obs[i++] = flYaw;
 	obs[i++] = clamp( (float)pBot->GetHealth() / (float)pBot->GetMaxHealth(), 0.0f, 1.0f );
 	obs[i++] = vecSelf.x;
@@ -175,24 +277,9 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 // engine-visibility check here instead is simpler and can't be wrong the
 // way a learned habit can.
 //
-// 2026-09-08: same story, second exploit. Live testing also showed the bot
-// spinning continuously at max turn rate while holding the fire button down
-// -- a fast spin sweeps across FVisible() often enough to intermittently
-// land free kills without the policy ever needing to actually settle onto
-// target. Four different attempts to close this in TRAINING itself (gating
-// the agent's own fire on N consecutive on-target frames, a decaying
-// version of the same, one with an added reward gradient, and finally an
-// instantaneous check on the shooter's current turn action -- see
-// sniper_duel_env.py's long comment above _resolve_fire) all destabilized
-// PPO's training dynamics once tested against the real curriculum's actual
-// shape, despite the underlying reward economy otherwise being proven
-// stable. Enforcing "don't fire while turning fast" here instead, on the
-// trained policy's raw action output, sidesteps training entirely -- same
-// fix category as the FVisible() gate above, and the threshold matches what
-// sniper_duel_env.py's abandoned MAX_TURN_WHILE_FIRING settled on before
-// that whole mechanic was reverted.
-static const float MAX_TURN_ACTION_WHILE_FIRING = 0.35f;
-
+// 2026-09-10: the policy's turn output (action[2]) is deliberately IGNORED --
+// see the AIM_* constants at the top of this file for why aiming moved here.
+// The policy still drives movement, scope and the intent to fire.
 static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float action[SniperPolicy::kActionSize] )
 {
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
@@ -202,9 +289,59 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 	// into one giant snap-turn instead of a normal small per-tick step.
 	float flTurnFrametime = MIN( gpGlobals->frametime, 0.1f );
 
+	bool bOpponentVisible = pBot->FVisible( pOpponent );
+
+	// Re-roll the steady-state aim offset each time a target is reacquired, so
+	// the bot doesn't converge on the exact same offset every fight. Stored in
+	// world units at the target and converted to an angle per tick below, so it
+	// stays correct at any range -- see the AIM_* comment.
+	if ( bOpponentVisible && !g_SniperBot.bHadTargetLastTick )
+	{
+		g_SniperBot.flAimErrorOffsetUnits = RandomFloat( -AIM_ERROR_UNITS, AIM_ERROR_UNITS );
+	}
+	g_SniperBot.bHadTargetLastTick = bOpponentVisible;
+
 	QAngle angViewAngles = pBot->EyeAngles();
-	angViewAngles.y = AngleNormalize( angViewAngles.y + action[2] * TURN_RATE_DEG_PER_SEC * flTurnFrametime );
-	angViewAngles.x = 0.0f;
+
+	// Analytic aim: slew the view toward the opponent's actual position at a
+	// bounded rate. Pitch is driven too -- the policy's 2D world had no concept
+	// of it, so a learned turn could never have aimed up or down at all.
+	float flAimErrorDeg = 180.0f;
+	float flSettleToleranceDeg = 0.0f;
+	if ( bOpponentVisible )
+	{
+		Vector vecAimAt = pOpponent->EyePosition();
+		Vector vecToTarget = vecAimAt - pBot->EyePosition();
+		float flRange = MAX( vecToTarget.Length(), 1.0f );
+
+		// Convert the linear tolerances into angles for THIS range, so a fixed
+		// number of world units means the same thing point-blank and across the
+		// map -- see the AIM_* comment above.
+		float flErrorDeg = RAD2DEG( atanf( g_SniperBot.flAimErrorOffsetUnits / flRange ) );
+		flSettleToleranceDeg = RAD2DEG( atanf( AIM_SETTLE_UNITS / flRange ) );
+
+		QAngle angWanted;
+		VectorAngles( vecToTarget, angWanted );
+		angWanted.y = AngleNormalize( angWanted.y + flErrorDeg );
+
+		float flMaxStep = AIM_SLEW_DEG_PER_SEC * flTurnFrametime;
+		float flYawDelta = AngleNormalize( angWanted.y - angViewAngles.y );
+		float flPitchDelta = AngleNormalize( angWanted.x - angViewAngles.x );
+
+		angViewAngles.y = AngleNormalize( angViewAngles.y + clamp( flYawDelta, -flMaxStep, flMaxStep ) );
+		angViewAngles.x = AngleNormalize( angViewAngles.x + clamp( flPitchDelta, -flMaxStep, flMaxStep ) );
+
+		// how far off we still are AFTER this tick's slew -- the fire gate below
+		// keys off this so the bot can't shoot mid-swing.
+		flAimErrorDeg = MAX( fabsf( AngleNormalize( angWanted.y - angViewAngles.y ) ),
+		                     fabsf( AngleNormalize( angWanted.x - angViewAngles.x ) ) );
+	}
+	else
+	{
+		// no target: let the policy's movement carry it, and keep the view level
+		// so it isn't left staring at the floor when it reacquires.
+		angViewAngles.x = Approach( 0.0f, angViewAngles.x, AIM_SLEW_DEG_PER_SEC * flTurnFrametime );
+	}
 	angViewAngles.z = 0.0f;
 
 	unsigned short usButtons = 0;
@@ -218,7 +355,36 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 		usButtons |= IN_ATTACK2;
 	}
 
-	if ( action[4] > 0.0f && pBot->FVisible( pOpponent ) && fabsf( action[2] ) <= MAX_TURN_ACTION_WHILE_FIRING )
+	// Fire gate. The policy supplies the INTENT to shoot; the bridge decides
+	// whether pulling the trigger now would actually be a shot rather than a
+	// wasted one. Three conditions, all mechanical:
+	//
+	//  - the opponent is really visible (engine trace, not a learned habit);
+	//  - the view has actually settled on them, so it can't fire mid-swing and
+	//    spray walls -- which is exactly what the previous build did, holding
+	//    the trigger while 32 degrees off target;
+	//  - the scope is charged enough to headshot IF we're scoped at all.
+	//
+	// That last one matters more than it looks: the rifle zeroes its charge on
+	// every shot, so a policy that holds the trigger down never accumulates any
+	// charge and can only ever land body shots. Live debug showed exactly that,
+	// scope_charge pinned at 0.00 on every single tick. Waiting for the charge
+	// is what makes a scoped bot lethal instead of an annoyance.
+	// 2026-09-10: requires being SCOPED, where this first read "!bIsZoomed ||
+	// ...". That disjunction meant the instant the rifle unscoped -- which it
+	// does after every shot -- the gate went true and the bot immediately fired
+	// again unscoped, so it body-shot forever and never scoped at all. Live
+	// debug showed scope_act flicking to 0 through whole fights. Scoping is
+	// mandatory for a headshot crit per the engine, and the 3x multiplier is the
+	// entire point of the class.
+	//
+	// The charge requirement is only the engine's 0.2s post-zoom crit lockout,
+	// NOT a damage consideration -- see AIM_MIN_CHARGE_TO_FIRE. It was 0.90
+	// briefly, which made the bot sit there for ~2.7s per shot for no benefit,
+	// since an uncharged headshot (150) already kills a 125 HP sniper outright.
+	bool bOnTarget = bOpponentVisible && flAimErrorDeg <= flSettleToleranceDeg;
+	bool bReadyToShoot = bIsZoomed && pRifle && pRifle->GetScopeChargePerc() >= AIM_MIN_CHARGE_TO_FIRE;
+	if ( action[4] > 0.0f && bOnTarget && bReadyToShoot )
 	{
 		usButtons |= IN_ATTACK;
 	}
@@ -270,13 +436,34 @@ static void DebugPrintTick( CTFPlayer *pBot, CTFPlayer *pOpponent, const float o
 	CTFSniperRifle *pRifle = dynamic_cast< CTFSniperRifle * >( pBot->GetActiveTFWeapon() );
 	const Vector &vecOpponentReal = pOpponent->GetAbsOrigin();
 
-	Msg( "[sniperbot] %s raw_pos=(%.1f,%.1f) raw_yaw=%.1f rifle_active=%d opp_real_pos=(%.1f,%.1f) obs=[opp_pos=(%.1f,%.1f) opp_vis=%.0f scope_act=%.0f scope_chg=%.2f self_ang=%.1f self_hp=%.2f self_pos=(%.1f,%.1f) t_left=%.2f] action=[strafe=%.2f fwd=%.2f turn=%.2f scope=%.2f fire=%.2f]\n",
+	// 2026-09-10: the obs indices below MUST track BuildObservation's layout.
+	// They silently didn't after aim_error_cos/sin were prepended (kObsSize 10
+	// -> 12), so every field printed one or two slots out of place -- self_pos
+	// showed (yaw, health), t_left showed self x, and scope_charge showed the
+	// visibility flag. An hour went into chasing a "broken" observation that was
+	// in fact correct; only the printout was wrong. aim_err_deg is derived back
+	// out of the sin/cos pair since that's the number worth eyeballing.
+	float flAimErrDeg = RAD2DEG( atan2f( obs[1], obs[0] ) );
+
+	Msg( "[sniperbot] %s raw_pos=(%.1f,%.1f) raw_yaw=%.1f pitch=%.1f rifle=%d opp_real=(%.1f,%.1f) "
+	     "obs=[aim_err=%.1f opp_pos=(%.1f,%.1f) opp_vis=%.0f scope_act=%.0f scope_chg=%.2f "
+	     "self_ang=%.1f self_hp=%.2f self_pos=(%.1f,%.1f) t_left=%.2f] "
+	     "action=[strafe=%.2f fwd=%.2f turn=%.2f(ignored) scope=%.2f fire=%.2f]\n",
 		pBot->GetPlayerName(),
 		pBot->GetAbsOrigin().x, pBot->GetAbsOrigin().y,
 		AngleNormalize( pBot->EyeAngles().y ),
+		AngleNormalize( pBot->EyeAngles().x ),
 		pRifle ? 1 : 0,
 		vecOpponentReal.x, vecOpponentReal.y,
-		obs[0], obs[1], obs[2], obs[3], obs[4], obs[5], obs[6], obs[7], obs[8], obs[9],
+		flAimErrDeg,
+		obs[2], obs[3],          // opponent_pos
+		obs[4],                  // opponent_visible
+		obs[5],                  // scope_active
+		obs[6],                  // scope_charge
+		obs[7],                  // self_angle
+		obs[8],                  // self_health
+		obs[9], obs[10],         // self_pos
+		obs[11],                 // time_left
 		action[0], action[1], action[2], action[3], action[4] );
 }
 

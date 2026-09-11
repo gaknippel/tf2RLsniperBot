@@ -36,6 +36,26 @@ EASY_SPAWN_Y = 125.0
 SELF_SPAWN_ANGLE = 0.0       # facing +x (RED), toward opponent
 OPPONENT_SPAWN_ANGLE = 180.0  # facing -x (BLU), toward self
 
+# 2026-09-10: how far the agent's starting yaw is randomized away from
+# SELF_SPAWN_ANGLE -- see reset(). 180 means "anywhere", so it has to find the
+# opponent rather than beginning every episode already aimed at it.
+#
+# Deliberately NOT ramped with difficulty, unlike every other knob here. It was
+# ramped at first (full spread only by difficulty 0.3) on the theory that early
+# training should get easy already-facing starts. That reintroduced the exact
+# exploit this is meant to remove: while the spread is small the agent spawns
+# effectively pre-aimed, "drift one way and fire when the target crosses the
+# crosshair" works again, and PPO took it -- measured aim generalization fell
+# from 65% in the behavior-cloned starting policy to 48% after 4.8M steps at
+# difficulty 0.10, i.e. training was actively destroying the one skill the
+# warm start existed to provide.
+#
+# There is no bootstrap argument for ramping it either, because training starts
+# from a clone that already aims (see pretrain_policy.py). Keeping the spread at
+# full from step one means the shortcut simply does not exist in any episode, so
+# there is nothing for PPO to rediscover.
+SPAWN_YAW_SPREAD_DEG = 180.0
+
 # top-down (x,y) footprints of the cover brushes in 1v1map.vmf, as
 # (x_min, x_max, y_min, y_max). taken directly from the .vmf solids.
 BARRIERS = np.array([
@@ -401,6 +421,30 @@ class SniperDuelEnv(gym.Env):
             "opponent_visible": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "time_left": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
             "self_health": spaces.Box(low=0.0, high=1.0, shape=(1,), dtype=np.float32),
+            # 2026-09-10: egocentric aim features, added after the 50M policy
+            # turned out not to have learned to aim at all. It scored a 98% hit
+            # rate in sim while, in game, sitting 73 degrees off target and
+            # outputting turn=0.00. Sweeping aim error across map positions
+            # showed it corrected the sign of its turn in only 2-5 of 8 cases
+            # anywhere -- it had learned "drift slowly one way and fire when the
+            # target crosses the crosshair", which wins here only because the
+            # agent always spawned at x=-500 facing +x with the opponent at
+            # x=+500, making the bearing to target permanently ~0 degrees.
+            #
+            # Absolute coordinates forced the network to derive the relative
+            # bearing itself via atan2 over self_pos/opponent_pos/self_angle,
+            # and it only ever fit that in the narrow slice of state space it
+            # actually visited. Handing it the relative bearing directly makes
+            # aiming a position-independent function of one input instead of a
+            # geometric derivation, which is the thing that should generalize
+            # to a human opponent who can be anywhere.
+            #
+            # Split into sin/cos rather than raw degrees so the value is
+            # continuous across the +-180 wrap, which a single angle channel is
+            # not -- a target just past 180 degrees would otherwise look maximally
+            # different from one just before it.
+            "aim_error_sin": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+            "aim_error_cos": spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
         })
 
     def set_difficulty(self, difficulty):
@@ -459,7 +503,19 @@ class SniperDuelEnv(gym.Env):
         self._opponent_pos[0] += self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER)
         self._opponent_pos[1] += self.np_random.uniform(-y_jitter, y_jitter)
 
-        self._self_angle = SELF_SPAWN_ANGLE
+        # 2026-09-10: the agent's starting yaw is randomized, ramping in with
+        # difficulty. It used to always be exactly SELF_SPAWN_ANGLE (0, facing
+        # +x) with the opponent always at +x, which meant the bearing to the
+        # target was permanently ~0 degrees and the agent began every single
+        # episode already pointed at it. Target acquisition was therefore never
+        # required, and the 50M policy never learned it -- it settled on
+        # drifting slowly in one direction until the opponent crossed its
+        # crosshair, which wins in that setup and is useless against a human
+        # who can be at any bearing. The opponent keeps its fixed facing; only
+        # the agent needs to learn to acquire.
+        self._self_angle = SELF_SPAWN_ANGLE + float(
+            self.np_random.uniform(-SPAWN_YAW_SPREAD_DEG, SPAWN_YAW_SPREAD_DEG))
+        self._self_angle = ((self._self_angle + 180.0) % 360.0) - 180.0
         self._opponent_angle = OPPONENT_SPAWN_ANGLE
 
         self._self_scope_active = False
@@ -608,6 +664,17 @@ class SniperDuelEnv(gym.Env):
         # down, and the one after that is free to fire again.
         return damage, FIRE_COOLDOWN_STEPS - 1, True
 
+    # 2026-09-10: taking a shot zeroes the shooter's scope charge, matching the
+    # real weapon. _update_scope only cleared charge on UNSCOPING, so in sim a
+    # policy could hold both scope and trigger and watch charge keep climbing --
+    # a charged headshot every FIRE_COOLDOWN_STEPS forever. TF2's rifle resets
+    # charge on every shot, so that strategy is unrealizable in game: live
+    # debug output showed scope_chg pinned at 0.00 on every single tick, meaning
+    # the deployed bot could only ever land body shots while its entire learned
+    # plan was built on headshots. This is the same category of bug as the
+    # missing fire cooldown -- the sim permitting something the real weapon
+    # cannot do, and the policy correctly exploiting it.
+
     def _scripted_opponent_action(self):
         # hand-authored BLU opponent, not a learned policy -- see the
         # "scripted opponent" block comment above for why. Turns toward self
@@ -707,10 +774,18 @@ class SniperDuelEnv(gym.Env):
             self._self_fire_cooldown, self_aimed,
             self._self_scope_active, self._self_scope_charge, action[4],
         )
-        damage_to_self, self._opponent_fire_cooldown, _ = self._try_fire(
+        damage_to_self, self._opponent_fire_cooldown, opponent_shot_taken = self._try_fire(
             self._opponent_fire_cooldown, opponent_aimed,
             self._opponent_scope_active, self._opponent_scope_charge, opponent_action[4],
         )
+        # taking a shot zeroes that shooter's charge -- see the note above
+        # _try_fire. Without this the sim lets a policy hold scope and trigger
+        # together and headshot on every cooldown, which the real rifle cannot do.
+        if self_shot_taken:
+            self._self_scope_charge = 0.0
+        if opponent_shot_taken:
+            self._opponent_scope_charge = 0.0
+
         self._opponent_health = max(0.0, self._opponent_health - damage_to_opponent)
         self._self_health = max(0.0, self._self_health - damage_to_self)
 
@@ -797,6 +872,20 @@ class SniperDuelEnv(gym.Env):
         else:
             other_pos_obs = np.zeros(2, dtype=np.float32)
 
+        # see the aim_error_sin/cos comment in __init__. Signed error between
+        # where the agent faces and the true bearing to the opponent, so a
+        # positive value always means "turn positive to correct", wherever on
+        # the map either of them happens to be. Zeroed with no line of sight,
+        # matching opponent_pos -- the agent shouldn't get a free aim cue
+        # through a wall.
+        if other_visible:
+            to_target = self._opponent_pos - self._self_pos
+            bearing = np.degrees(np.arctan2(to_target[1], to_target[0]))
+            err = np.radians(((bearing - self._self_angle + 180.0) % 360.0) - 180.0)
+            aim_sin, aim_cos = float(np.sin(err)), float(np.cos(err))
+        else:
+            aim_sin, aim_cos = 0.0, 0.0
+
         return {
             "self_pos": self._self_pos.astype(np.float32).copy(),
             "self_angle": np.array([self._self_angle], dtype=np.float32),
@@ -806,6 +895,8 @@ class SniperDuelEnv(gym.Env):
             "opponent_visible": np.array([1.0 if other_visible else 0.0], dtype=np.float32),
             "time_left": np.array([time_left], dtype=np.float32),
             "self_health": np.array([self._self_health / MAX_HEALTH], dtype=np.float32),
+            "aim_error_sin": np.array([aim_sin], dtype=np.float32),
+            "aim_error_cos": np.array([aim_cos], dtype=np.float32),
         }
 
 

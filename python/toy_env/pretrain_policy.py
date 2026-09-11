@@ -39,6 +39,7 @@ from stable_baselines3.common.vec_env import DummyVecEnv
 
 from sniper_duel_env import (
     SniperDuelEnv, AIM_TOLERANCE_DEG, MAX_TURN_PER_STEP_DEG, MIN_CHARGE_FOR_HEADSHOT,
+    MAX_HEALTH, MAX_EPISODE_STEPS, POSITION_LOW, POSITION_HIGH,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -74,6 +75,13 @@ def expert_action(env):
         strafe, fwd = 0.0, 0.0           # hold the sightline
     else:
         strafe, fwd = 0.0, 0.7           # go looking for one
+
+    # 2026-09-10: fire only on a charged headshot, and only while on target.
+    # Firing now zeroes scope charge (matching the real rifle), so holding the
+    # trigger would reset the charge every cooldown and make a headshot
+    # impossible -- the expert has to deliberately wait for the charge instead.
+    # This is also what teaches trigger discipline rather than "hold it down",
+    # which is what the previous clone learned when charge was free.
     fire = 1.0 if (has_los and aimed and charged) else -1.0
     return np.array([strafe, fwd, turn, 1.0, fire], dtype=np.float32)
 
@@ -96,12 +104,59 @@ def collect(episodes):
     return obs_batches, np.array(act_batches, dtype=np.float32)
 
 
+def collect_aim_coverage(n_states=40000):
+    """Synthetic state coverage for target acquisition, off-trajectory.
+
+    2026-09-10: trajectory data alone does not teach aiming. The expert corrects
+    its aim within a few ticks, so rollouts are overwhelmingly small-error
+    states and a clone fit to them turns correctly in only ~40% of swept aim
+    errors -- the same blind spot that let the previous 50M policy ship unable
+    to aim at all.
+
+    The expert is a known function of state rather than something that has to
+    be rolled out, so the aim mapping can be taught directly: sample positions
+    and yaws across the whole arena, keep the ones with a real sightline, and
+    label each with what the expert would do there. This covers the large-error
+    states a trajectory almost never visits, which is exactly what aiming at a
+    human who can be at any bearing requires.
+    """
+    env = SniperDuelEnv()
+    env.set_difficulty(0.5)
+    rng = np.random.default_rng(12345)
+    obs_batches, act_batches = [], []
+    attempts = 0
+    while len(act_batches) < n_states and attempts < n_states * 60:
+        attempts += 1
+        slf = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
+        opp = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
+        if not env._line_of_sight_clear(slf, opp):
+            continue
+        env._self_pos, env._opponent_pos = slf, opp
+        env._self_angle = float(rng.uniform(-180.0, 180.0))
+        env._self_scope_active = True
+        env._self_scope_charge = float(rng.uniform(0.0, 1.0))
+        env._self_health = float(rng.uniform(0.3, 1.0)) * MAX_HEALTH
+        env._self_fire_cooldown = int(rng.integers(0, 2))
+        env._step_count = int(rng.integers(0, MAX_EPISODE_STEPS))
+        obs_batches.append({k: v.copy() for k, v in env._get_obs().items()})
+        act_batches.append(expert_action(env))
+    return obs_batches, np.array(act_batches, dtype=np.float32)
+
+
 def main():
     out_path = sys.argv[1] if len(sys.argv) > 1 else DEFAULT_OUT
 
     print(f"collecting {EPISODES} expert episodes across difficulties {DIFFICULTIES} ...")
     obs_list, actions = collect(EPISODES)
-    print(f"  {len(actions)} state-action pairs\n")
+    print(f"  {len(actions)} trajectory pairs")
+
+    # see collect_aim_coverage -- trajectories barely contain large aim errors,
+    # so the aim mapping is taught from direct state-space coverage as well.
+    cov_obs, cov_actions = collect_aim_coverage()
+    print(f"  {len(cov_actions)} synthetic aim-coverage pairs")
+    obs_list = obs_list + cov_obs
+    actions = np.concatenate([actions, cov_actions], axis=0)
+    print(f"  {len(actions)} total\n")
 
     vec_env = DummyVecEnv([lambda: Monitor(SniperDuelEnv())])
     model = PPO("MultiInputPolicy", vec_env, verbose=0, ent_coef=0.0)

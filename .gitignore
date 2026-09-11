@@ -36,6 +36,17 @@
 !/src/game/server/tf/tf_client.cpp
 !/src/game/server/server_tf.vpc
 
+# 2026-09-10: the RL bot needs the sniper rifle's scope charge server-side, and
+# the existing accessor for it (GetHUDDamagePerc) is CLIENT_DLL only -- these
+# carry the small GetScopeChargePerc() addition. Without them the mod does not
+# build, so they have to be tracked.
+!/src/game/shared/
+/src/game/shared/*
+!/src/game/shared/tf/
+/src/game/shared/tf/*
+!/src/game/shared/tf/tf_weapon_sniperrifle.h
+!/src/game/shared/tf/tf_weapon_sniperrifle.cpp
+
 !/game/
 /game/*
 !/game/mod_tf/

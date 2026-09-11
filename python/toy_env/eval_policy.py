@@ -31,7 +31,8 @@ from stable_baselines3 import PPO
 
 from sniper_duel_env import (
     SniperDuelEnv, AIM_TOLERANCE_DEG, FIRE_COOLDOWN_STEPS, MAX_EPISODE_STEPS,
-    MIN_CHARGE_FOR_HEADSHOT, UNSCOPED_HIT_DAMAGE,
+    MIN_CHARGE_FOR_HEADSHOT, UNSCOPED_HIT_DAMAGE, MAX_HEALTH,
+    POSITION_LOW, POSITION_HIGH,
 )
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -123,7 +124,49 @@ def evaluate(model, difficulty, n_episodes, seed_base=0):
     }
 
 
-def verdict(rows):
+def aim_generalization(model, n_positions=6, errors=(-120, -90, -45, -20, -5, 5, 20, 45, 90, 120)):
+    """Does the policy actually turn toward the target, anywhere on the map?
+
+    2026-09-10: added after a policy with a 98% in-sim hit rate shipped and sat
+    73 degrees off target in game, outputting turn=0.00. In-sim metrics could
+    not see it: the agent always spawned facing the opponent with the bearing
+    permanently near 0, so "drift slowly one way and fire when the target
+    crosses the crosshair" scored just as well as aiming. This probes the skill
+    directly and independently of the episode dynamics that hid its absence --
+    place the pair at many positions, sweep the aim error, and check the turn
+    output actually points the right way.
+    """
+    env = SniperDuelEnv()
+    env.set_difficulty(0.5)
+    rng = np.random.default_rng(0)
+    good = total = 0
+    for _ in range(n_positions):
+        # sample a pair with a clear sightline so the aim cue is live
+        for _attempt in range(200):
+            slf = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
+            opp = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
+            if env._line_of_sight_clear(slf, opp):
+                break
+        else:
+            continue
+        bearing = np.degrees(np.arctan2(opp[1] - slf[1], opp[0] - slf[0]))
+        for err in errors:
+            env._self_pos, env._opponent_pos = slf.copy(), opp.copy()
+            env._self_angle = float(((bearing - err + 180.0) % 360.0) - 180.0)
+            env._self_scope_active, env._self_scope_charge = True, 0.5
+            env._self_health = MAX_HEALTH
+            env._self_fire_cooldown = 0
+            env._step_count = 60
+            action, _ = model.predict(env._get_obs(), deterministic=True)
+            turn = float(np.asarray(action)[2])
+            # correct means: turns the right way, with some actual magnitude
+            if np.sign(turn) == np.sign(err) and abs(turn) > 0.05:
+                good += 1
+            total += 1
+    return good / total if total else 0.0
+
+
+def verdict(rows, aim_score=None):
     """Explicit pass/fail on the two known degenerate behaviors.
 
     Thresholds are deliberately loose -- they are meant to catch a policy that
@@ -168,6 +211,11 @@ def verdict(rows):
         problems.append(
             "INEFFECTIVE: wins < 5% at EVERY difficulty, including the easiest "
             "-- whatever it is doing, it does not work")
+    if aim_score is not None and aim_score < 0.6:
+        problems.append(
+            f"CANNOT AIM: turns the correct way in only {aim_score*100:.0f}% of "
+            "swept aim errors across random map positions -- it has not learned "
+            "general target acquisition, it has fit the spawn geometry")
     if all(r["hit_rate"] < 10.0 for r in rows):
         problems.append(
             "INEFFECTIVE: hit rate < 10% at every difficulty -- shots are not "
@@ -200,7 +248,12 @@ def main():
               f"{r['shots_per_ep']:>9.1f} {r['hit_rate']:>6.1f} "
               f"{r['scope_pct']:>7.1f} {r['charged_shot_pct']:>9.1f} {r['headshots']:>4}")
 
-    problems = verdict(rows)
+    aim_score = aim_generalization(model)
+    print()
+    print(f"aim generalization: turns the correct way in {aim_score*100:.0f}% of "
+          f"swept aim errors at random map positions (want >=60%)")
+
+    problems = verdict(rows, aim_score)
     print()
     if problems:
         print("VERDICT: FAIL -- degenerate behavior detected")

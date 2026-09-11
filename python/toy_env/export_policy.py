@@ -16,6 +16,8 @@ EXPORT_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_policy.json")
 # via model.policy.features_extractor.extractors.keys(); do not assume
 # insertion order here or in the C++ port.
 OBS_KEY_ORDER = [
+    "aim_error_cos",      # 1
+    "aim_error_sin",      # 1
     "opponent_pos",       # 2
     "opponent_visible",   # 1
     "scope_active",       # 1
