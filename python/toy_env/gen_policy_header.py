@@ -94,6 +94,25 @@ def main():
     lines.append("")
     lines.append("\t// obs_key_order from export_policy.py, for reference when building the")
     lines.append("\t// C++ observation vector -- MUST match this order exactly:")
+    # 2026-09-11: the per-dimension Gaussian std the policy was trained with.
+    # PPO emits a MEAN; the behaviour that got optimised is a sample from
+    # N(mean, std). Shipping weights without the std deploys a different agent
+    # than the one trained -- see the long note in export_policy.py.
+    action_std = policy.get("action_std")
+    if action_std is None:
+        raise SystemExit(
+            "policy JSON has no 'action_std' -- re-run export_policy.py. The std is "
+            "required: without it the DLL runs the deterministic policy, whose fire "
+            "output never crosses its threshold (see export_policy.py).")
+    lines.append("\t// Per-dimension Gaussian std from training. The action the policy")
+    lines.append("\t// actually takes is a SAMPLE from N(mean, std), not the mean: the")
+    lines.append("\t// fire dimension's mean never crosses its threshold, so a mean-only")
+    lines.append("\t// bot never shoots. See export_policy.py for the measurements.")
+    lines.append(f"\tconst float kActionStd[{action_size}] =")
+    lines.append("\t{")
+    lines.append(format_float_array(action_std, indent="\t\t"))
+    lines.append("\t};")
+    lines.append("")
     for key in policy["obs_key_order"]:
         lines.append(f"\t// - {key}")
     lines.append("}")

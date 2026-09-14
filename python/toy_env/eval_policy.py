@@ -42,7 +42,7 @@ DIFFICULTIES = (0.0, 0.25, 0.5, 0.75, 1.0)
 EPISODES_PER_DIFFICULTY = 60
 
 
-def evaluate(model, difficulty, n_episodes, seed_base=0):
+def evaluate(model, difficulty, n_episodes, seed_base=0, deterministic=True):
     env = SniperDuelEnv()
     env.set_difficulty(difficulty)
 
@@ -56,7 +56,7 @@ def evaluate(model, difficulty, n_episodes, seed_base=0):
         obs, _ = env.reset(seed=seed_base + ep)
         steps = 0
         while True:
-            action, _ = model.predict(obs, deterministic=True)
+            action, _ = model.predict(obs, deterministic=deterministic)
             action = np.asarray(action, dtype=np.float32)
 
             # sampled before step() so they describe the state the policy
@@ -79,12 +79,24 @@ def evaluate(model, difficulty, n_episodes, seed_base=0):
                        and env._self_scope_charge >= MIN_CHARGE_FOR_HEADSHOT)
             if action[4] > 0.0:
                 trigger_ticks += 1
-                if ready:
-                    shots_taken += 1
-                    if charged:
-                        charged_shots += 1
 
             obs, _, term, trunc, _ = env.step(action)
+
+            # 2026-09-12: a "shot" is now detected from the cooldown actually
+            # being spent, not from "trigger pulled while off cooldown".
+            #
+            # Those used to be the same thing. They stopped being the same when
+            # _try_fire gained bridge parity: a pull with no line of sight is a
+            # free no-op now, so it leaves the cooldown at 0 and the old test
+            # counted it as a shot. That inflated shots/ep past the cooldown's
+            # own ceiling (15.2 per episode against a hard cap near 13, which is
+            # how the bug announced itself) and correspondingly deflated hit%,
+            # since every no-op counted as a miss. Both columns were describing
+            # trigger pulls while claiming to describe shots.
+            if env._self_fire_cooldown == FIRE_COOLDOWN_STEPS - 1 and ready:
+                shots_taken += 1
+                if charged:
+                    charged_shots += 1
             dealt = hp_before - env._opponent_health
             if dealt > 0:
                 shots_hit += 1
@@ -117,6 +129,17 @@ def evaluate(model, difficulty, n_episodes, seed_base=0):
         "trigger_pct": trigger_ticks / total_ticks * 100,
         "shots": shots_taken,
         "hit_rate": (shots_hit / shots_taken * 100) if shots_taken else 0.0,
+        # 2026-09-12: hit_rate is ~100% by construction now -- _try_fire only
+        # spends a shot when the bot is on target and charged, so a shot that
+        # exists is a shot that connected. It stays as a column for sanity, but
+        # it can no longer distinguish a good policy from a bad one.
+        #
+        # conversion replaces it as the discipline signal: of all the ticks the
+        # policy held the trigger, how many became actual shots. Wasted pulls are
+        # free in game (the bridge drops them), so a low number is not a bug --
+        # but it does say the policy is squeezing the trigger blind rather than
+        # choosing moments, which is what the spray checks below look for.
+        "conversion": (shots_taken / trigger_ticks * 100) if trigger_ticks else 0.0,
         "shots_per_ep": shots_taken / n_episodes,
         "scope_pct": scope_ticks / total_ticks * 100,
         "charged_shot_pct": (charged_shots / shots_taken * 100) if shots_taken else 0.0,
@@ -124,49 +147,7 @@ def evaluate(model, difficulty, n_episodes, seed_base=0):
     }
 
 
-def aim_generalization(model, n_positions=6, errors=(-120, -90, -45, -20, -5, 5, 20, 45, 90, 120)):
-    """Does the policy actually turn toward the target, anywhere on the map?
-
-    2026-09-10: added after a policy with a 98% in-sim hit rate shipped and sat
-    73 degrees off target in game, outputting turn=0.00. In-sim metrics could
-    not see it: the agent always spawned facing the opponent with the bearing
-    permanently near 0, so "drift slowly one way and fire when the target
-    crosses the crosshair" scored just as well as aiming. This probes the skill
-    directly and independently of the episode dynamics that hid its absence --
-    place the pair at many positions, sweep the aim error, and check the turn
-    output actually points the right way.
-    """
-    env = SniperDuelEnv()
-    env.set_difficulty(0.5)
-    rng = np.random.default_rng(0)
-    good = total = 0
-    for _ in range(n_positions):
-        # sample a pair with a clear sightline so the aim cue is live
-        for _attempt in range(200):
-            slf = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
-            opp = rng.uniform(POSITION_LOW, POSITION_HIGH).astype(np.float32)
-            if env._line_of_sight_clear(slf, opp):
-                break
-        else:
-            continue
-        bearing = np.degrees(np.arctan2(opp[1] - slf[1], opp[0] - slf[0]))
-        for err in errors:
-            env._self_pos, env._opponent_pos = slf.copy(), opp.copy()
-            env._self_angle = float(((bearing - err + 180.0) % 360.0) - 180.0)
-            env._self_scope_active, env._self_scope_charge = True, 0.5
-            env._self_health = MAX_HEALTH
-            env._self_fire_cooldown = 0
-            env._step_count = 60
-            action, _ = model.predict(env._get_obs(), deterministic=True)
-            turn = float(np.asarray(action)[2])
-            # correct means: turns the right way, with some actual magnitude
-            if np.sign(turn) == np.sign(err) and abs(turn) > 0.05:
-                good += 1
-            total += 1
-    return good / total if total else 0.0
-
-
-def verdict(rows, aim_score=None):
+def verdict(rows):
     """Explicit pass/fail on the two known degenerate behaviors.
 
     Thresholds are deliberately loose -- they are meant to catch a policy that
@@ -175,19 +156,31 @@ def verdict(rows, aim_score=None):
     problems = []
     hard = [r for r in rows if r["difficulty"] >= 0.5]
 
-    if all(r["turn_median"] > 0.8 for r in hard):
-        problems.append(
-            "SPIN: |turn| median > 0.8 at every hard difficulty -- policy is "
-            "holding max turn rate, i.e. spinning rather than aiming")
-    if all(r["aim_err"] > 45.0 for r in hard):
+    # 2026-09-10: the "|turn| median > 0.8 means it's spinning" check is gone.
+    # It was the original spin-and-spray detector and it did its job, but the
+    # env and the bridge now both ignore action[2] -- a policy could emit 1.0
+    # there forever and the view would not move, so the check can only produce
+    # false failures. The turn_* columns are still reported for information.
+    #
+    # Aim error is still worth failing on, but only together with a poor hit
+    # rate: it averages over no-line-of-sight ticks too, where the bot has
+    # nothing to aim at and simply holds its last yaw, so a large mean is normal
+    # for a policy that spends time repositioning behind cover.
+    # 2026-09-12: these two used to be gated on hit_rate, which is now ~100% by
+    # construction (see "conversion" above) and so could never fail again.
+    # Rewritten against shots actually taken, which is the quantity that still
+    # separates a working policy from a broken one.
+    if all(r["aim_err"] > 60.0 for r in hard) and all(r["shots_per_ep"] < 0.2 for r in hard):
         errs = ", ".join(f"{r['aim_err']:.0f}" for r in hard)
         problems.append(
-            f"SPIN: mean aim error > 45 deg at every hard difficulty ({errs}) "
-            "-- policy is rarely pointed anywhere near the target")
-    if all(r["trigger_pct"] > 95.0 for r in hard) and all(r["hit_rate"] < 25.0 for r in hard):
+            f"NOT AIMING: mean aim error > 60 deg ({errs}) and under 0.2 shots "
+            "per episode at every hard difficulty -- the bot is never settling "
+            "on target long enough to take a shot, which points at the aim path "
+            "rather than at the policy")
+    if all(r["trigger_pct"] > 95.0 for r in hard) and all(r["conversion"] < 5.0 for r in hard):
         problems.append(
-            "SPRAY: trigger held > 95% of ticks with hit rate < 25% -- "
-            "policy is spamming fire rather than picking shots")
+            "SPRAY: trigger held > 95% of ticks while under 5% of pulls become "
+            "shots -- policy is squeezing blind rather than picking moments")
 
     if all(r["los_pct"] < 2.0 for r in hard):
         problems.append(
@@ -211,15 +204,18 @@ def verdict(rows, aim_score=None):
         problems.append(
             "INEFFECTIVE: wins < 5% at EVERY difficulty, including the easiest "
             "-- whatever it is doing, it does not work")
-    if aim_score is not None and aim_score < 0.6:
+    # 2026-09-10: the aim-generalization probe that used to live here is gone.
+    # It swept aim error and checked the sign of action[2], which was the right
+    # check while the policy steered its own view -- it caught a policy that
+    # turned correctly in only 40% of cases. Both the env and the bridge now aim
+    # analytically and ignore action[2] entirely, so that probe could only ever
+    # report ~0% and fail every healthy policy. Aim quality is no longer the
+    # policy's responsibility, and the aim_err column below reflects the
+    # analytic aim rather than anything learned.
+    if all(r["shots_per_ep"] < 0.1 for r in rows):
         problems.append(
-            f"CANNOT AIM: turns the correct way in only {aim_score*100:.0f}% of "
-            "swept aim errors across random map positions -- it has not learned "
-            "general target acquisition, it has fit the spawn geometry")
-    if all(r["hit_rate"] < 10.0 for r in rows):
-        problems.append(
-            "INEFFECTIVE: hit rate < 10% at every difficulty -- shots are not "
-            "connecting, so aim is broken regardless of the other stats")
+            "INEFFECTIVE: under 0.1 shots per episode at every difficulty -- the "
+            "bot almost never gets a real shot away, whatever the win rate says")
 
     return problems
 
@@ -234,26 +230,68 @@ def main():
           f"{MAX_EPISODE_STEPS // FIRE_COOLDOWN_STEPS} shots per episode)\n")
 
     model = PPO.load(model_path)
-    rows = [evaluate(model, d, n_eps, seed_base=1000 + int(d * 1000)) for d in DIFFICULTIES]
+
+    # 2026-09-11: both action-selection modes are reported, because the gap
+    # between them WAS the bug that kept shipping broken bots.
+    #
+    # PPO learns a Gaussian over actions; model.predict(deterministic=True)
+    # returns its mean, deterministic=False samples it. The C++ bridge ran the
+    # mean for this project's entire history, while every training metric
+    # described the samples -- so training could honestly report a 90%+ win rate
+    # while the deployed bot stood still and never fired. The fire dimension is
+    # the reason: its mean sits near -0.8 against a 0.0 threshold and never
+    # crosses, so the learned ~12% trigger rate exists only in the variance.
+    #
+    # The bridge now samples too (SniperPolicy::Forward, bStochastic), so
+    # STOCHASTIC is the row that predicts in-game behaviour. The deterministic
+    # row is kept as the diagnostic: a large gap means the policy is leaning on
+    # sampling noise, which is worth knowing even though it is now faithfully
+    # reproduced.
+    std = np.exp(model.policy.log_std.detach().cpu().numpy())
+    print("action std (the sampling the bridge reproduces): " + ", ".join(
+        f"{n}={v:.3f}" for n, v in zip(("strafe", "fwd", "turn", "scope", "fire"), std)))
+    print()
+
+    rows = [evaluate(model, d, n_eps, seed_base=1000 + int(d * 1000),
+                     deterministic=False) for d in DIFFICULTIES]
+    det_rows = [evaluate(model, d, n_eps, seed_base=1000 + int(d * 1000),
+                         deterministic=True) for d in DIFFICULTIES]
 
     hdr = (f"{'diff':>5} {'win%':>6} {'eplen':>6} {'LOS%':>6} {'onTgt%':>7} "
-           f"{'aimErr':>7} {'turn~':>6} {'trig%':>6} {'shots/ep':>9} {'hit%':>6} "
+           f"{'aimErr':>7} {'turn~':>6} {'trig%':>6} {'shots/ep':>9} {'conv%':>6} "
            f"{'scope%':>7} {'chgShot%':>9} {'HS':>4}")
+    print("STOCHASTIC -- matches how the DLL runs the policy in-game:")
     print(hdr)
     print("-" * len(hdr))
     for r in rows:
         print(f"{r['difficulty']:>5.2f} {r['win_rate']*100:>6.1f} {r['ep_len']:>6.0f} "
               f"{r['los_pct']:>6.1f} {r['on_target_pct']:>7.1f} {r['aim_err']:>7.1f} "
               f"{r['turn_median']:>6.2f} {r['trigger_pct']:>6.1f} "
-              f"{r['shots_per_ep']:>9.1f} {r['hit_rate']:>6.1f} "
+              f"{r['shots_per_ep']:>9.1f} {r['conversion']:>6.1f} "
               f"{r['scope_pct']:>7.1f} {r['charged_shot_pct']:>9.1f} {r['headshots']:>4}")
 
-    aim_score = aim_generalization(model)
     print()
-    print(f"aim generalization: turns the correct way in {aim_score*100:.0f}% of "
-          f"swept aim errors at random map positions (want >=60%)")
+    print("DETERMINISTIC (network mean) -- diagnostic only, not what ships:")
+    print(f"{'diff':>5} {'win%':>6} {'trig%':>6} {'shots/ep':>9} {'hit%':>6}   delta win%")
+    for r, d in zip(rows, det_rows):
+        print(f"{d['difficulty']:>5.2f} {d['win_rate']*100:>6.1f} "
+              f"{d['trigger_pct']:>6.1f} {d['shots_per_ep']:>9.1f} {d['hit_rate']:>6.1f}   "
+              f"{(r['win_rate'] - d['win_rate'])*100:>+8.1f}")
 
-    problems = verdict(rows, aim_score)
+    problems = verdict(rows)
+
+    # A policy whose competence lives entirely in its sampling noise is fragile:
+    # it is correct in-game only as long as the bridge keeps sampling, and it
+    # says the mean never learned the behaviour. Reported, not failed -- the
+    # bridge does sample, so this is a note about robustness rather than a bug.
+    mean_det_trig = float(np.mean([d["trigger_pct"] for d in det_rows]))
+    mean_sto_trig = float(np.mean([r["trigger_pct"] for r in rows]))
+    if mean_sto_trig > 2.0 and mean_det_trig < mean_sto_trig * 0.25:
+        print()
+        print(f"NOTE: trigger rate is {mean_sto_trig:.1f}% sampled vs "
+              f"{mean_det_trig:.1f}% at the mean -- firing is driven by sampling",
+              "noise rather than by the mean crossing its threshold. Fine as long",
+              "as the bridge samples (it does), but the mean has not learned it.")
     print()
     if problems:
         print("VERDICT: FAIL -- degenerate behavior detected")

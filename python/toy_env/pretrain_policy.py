@@ -38,7 +38,7 @@ from stable_baselines3.common.monitor import Monitor
 from stable_baselines3.common.vec_env import DummyVecEnv
 
 from sniper_duel_env import (
-    SniperDuelEnv, AIM_TOLERANCE_DEG, MAX_TURN_PER_STEP_DEG, MIN_CHARGE_FOR_HEADSHOT,
+    SniperDuelEnv, AIM_TOLERANCE_DEG, MIN_CHARGE_TO_FIRE,
     MAX_HEALTH, MAX_EPISODE_STEPS, POSITION_LOW, POSITION_HIGH,
 )
 
@@ -62,14 +62,16 @@ def expert_action(env):
     blocked by cover. This keeps the demonstrated behavior 'seek a sightline,
     then hold it'.
     """
-    to_opp = env._opponent_pos - env._self_pos
-    bearing = np.degrees(np.arctan2(to_opp[1], to_opp[0]))
-    diff = ((bearing - env._self_angle + 180.0) % 360.0) - 180.0
-    turn = float(np.clip(diff / MAX_TURN_PER_STEP_DEG, -1.0, 1.0))
+    # 2026-09-10: turn is no longer demonstrated -- the env aims the agent
+    # analytically now (see sniper_duel_env.py's AIM_SLEW_DEG_PER_STEP) exactly
+    # as the C++ bridge does, and action[2] is ignored on both sides. The expert
+    # only has to demonstrate the decisions the policy actually controls:
+    # movement, scope, and when to pull the trigger.
+    turn = 0.0
 
     has_los = env._line_of_sight_clear(env._self_pos, env._opponent_pos)
-    aimed = abs(diff) <= AIM_TOLERANCE_DEG
-    charged = env._self_scope_charge >= MIN_CHARGE_FOR_HEADSHOT
+    aimed = env._aim_error_deg(env._self_pos, env._self_angle, env._opponent_pos) <= AIM_TOLERANCE_DEG
+    charged = env._self_scope_charge >= MIN_CHARGE_TO_FIRE
 
     if has_los:
         strafe, fwd = 0.0, 0.0           # hold the sightline

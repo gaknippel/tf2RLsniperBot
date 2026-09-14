@@ -1,0 +1,49 @@
+Traceback (most recent call last):
+  File "C:\Users\CRITTERBOX\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\connection.py", line 342, in _recv_bytes
+    nread, err = ov.GetOverlappedResult(True)
+                 ~~~~~~~~~~~~~~~~~~~~~~^^^^^^
+BrokenPipeError: [WinError 109] The pipe has been ended
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "E:\Repos\source-sdk-2013\python\toy_env\train.py", line 148, in <module>
+    main()
+    ~~~~^^
+  File "E:\Repos\source-sdk-2013\python\toy_env\train.py", line 137, in main
+    model.learn(
+    ~~~~~~~~~~~^
+        total_timesteps=TOTAL_TIMESTEPS,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+        callback=callback,
+        ^^^^^^^^^^^^^^^^^^
+        tb_log_name=TENSORBOARD_RUN_NAME,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "E:\Repos\source-sdk-2013\python\.venv\Lib\site-packages\stable_baselines3\ppo\ppo.py", line 311, in learn
+    return super().learn(
+           ~~~~~~~~~~~~~^
+        total_timesteps=total_timesteps,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+    ...<4 lines>...
+        progress_bar=progress_bar,
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^
+    )
+    ^
+  File "E:\Repos\source-sdk-2013\python\.venv\Lib\site-packages\stable_baselines3\common\on_policy_algorithm.py", line 324, in learn
+    continue_training = self.collect_rollouts(self.env, callback, self.rollout_buffer, n_rollout_steps=self.n_steps)
+  File "E:\Repos\source-sdk-2013\python\.venv\Lib\site-packages\stable_baselines3\common\on_policy_algorithm.py", line 218, in collect_rollouts
+    new_obs, rewards, dones, infos = env.step(clipped_actions)
+                                     ~~~~~~~~^^^^^^^^^^^^^^^^^
+  File "E:\Repos\source-sdk-2013\python\.venv\Lib\site-packages\stable_baselines3\common\vec_env\base_vec_env.py", line 222, in step
+    return self.step_wait()
+           ~~~~~~~~~~~~~~^^
+  File "E:\Repos\source-sdk-2013\python\.venv\Lib\site-packages\stable_baselines3\common\vec_env\subproc_vec_env.py", line 137, in step_wait
+    results = [remote.recv() for remote in self.remotes]
+               ~~~~~~~~~~~^^
+  File "C:\Users\CRITTERBOX\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\connection.py", line 260, in recv
+    buf = self._recv_bytes()
+  File "C:\Users\CRITTERBOX\AppData\Local\Python\pythoncore-3.14-64\Lib\multiprocessing\connection.py", line 357, in _recv_bytes
+    raise EOFError
+EOFError

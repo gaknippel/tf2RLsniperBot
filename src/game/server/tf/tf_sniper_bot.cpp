@@ -95,6 +95,27 @@ static const float AIM_ERROR_UNITS = 6.0f;
 static const float AIM_SETTLE_UNITS = 14.0f;
 static const float AIM_MIN_CHARGE_TO_FIRE = 0.15f;
 
+// The policy was trained at 15 decisions per second (MAX_EPISODE_STEPS=300 over
+// EPISODE_DURATION_SECONDS=20 in sniper_duel_env.py) and MUST be run at that
+// rate, not once per server tick.
+//
+// Running it every tick (~66Hz) is not "the same policy, smoother" -- it changes
+// the behaviour in two ways, both of which showed up in live play:
+//
+//  * Movement became a random walk. One sampled action is meant to persist for
+//    1/15s, which at 300 u/s is ~20 units of committed travel. At 66Hz each
+//    action survives ~4.5 units before being replaced by an independent sample,
+//    so opposing draws cancel and the bot mills around instead of crossing the
+//    map with intent.
+//  * The trigger fired ~4.4x more often than trained. Firing is a per-decision
+//    Bernoulli draw (see the log_std note in export_policy.py); quadrupling the
+//    decision rate quadruples the shots, which reads in game as the bot
+//    randomly snap-firing the instant a sightline opens.
+//
+// Aiming deliberately does NOT run at this rate -- it is analytic bridge code,
+// not policy output, so it keeps updating every tick and stays smooth.
+static const float POLICY_DECISIONS_PER_SECOND = 15.0f;
+
 // Must match sniper_duel_env.py's POSITION_LOW/POSITION_HIGH exactly -- see
 // that file's comment for the full derivation. Surveyed from the compiled
 // map's actual wall brushes (inner faces at x=-639/647, y=-479/459) minus a
@@ -116,6 +137,11 @@ struct SniperBotSlot_t
 	// time the bot reacquires a target, so it doesn't settle pixel-perfect.
 	float flAimErrorOffsetUnits;
 	bool bHadTargetLastTick;
+	// see POLICY_DECISIONS_PER_SECOND -- the policy is re-evaluated on a fixed
+	// schedule and its action held in between, rather than re-sampled every tick.
+	float flNextPolicyTime;
+	float flHeldAction[SniperPolicy::kActionSize];
+	bool bHasHeldAction;
 };
 
 static SniperBotSlot_t g_SniperBot; // RED only -- see the file-header comment.
@@ -212,7 +238,16 @@ static void BuildObservation( CTFPlayer *pBot, CTFPlayer *pOpponent, float flAli
 
 	float flYaw = AngleNormalize( pBot->EyeAngles().y );
 
-	float flTimeLeft = 1.0f - ( ( gpGlobals->curtime - flAliveSince ) / EPISODE_DURATION_SECONDS );
+	// 2026-09-10: wraps instead of clamping at 0. Training episodes were exactly
+	// EPISODE_DURATION_SECONDS long, so the policy only ever saw this count down
+	// 1 -> 0 and then the episode ended. A real life here routinely outlasts that,
+	// and the old clamp pinned the value at 0.00 for the rest of the life -- live
+	// debug showed t_left=0.00 on literally every tick of a fight. That fed the
+	// policy a permanent "episode is ending right now" signal it never
+	// experienced mid-fight while training, i.e. an out-of-distribution input on
+	// every decision. Cycling keeps it inside the range the policy knows.
+	float flLifeSeconds = gpGlobals->curtime - flAliveSince;
+	float flTimeLeft = 1.0f - fmodf( flLifeSeconds / EPISODE_DURATION_SECONDS, 1.0f );
 	flTimeLeft = clamp( flTimeLeft, 0.0f, 1.0f );
 
 	// 2026-09-10: egocentric aim error, added after the previous policy turned
@@ -512,20 +547,35 @@ void SniperBot_RunAll()
 
 	if ( !g_SniperBot.bWasAlive )
 	{
-		// just respawned -- restart this bot's time_left clock
+		// just respawned -- restart this bot's time_left clock, and force a fresh
+		// policy decision rather than carrying the previous life's action over.
 		g_SniperBot.flAliveSince = gpGlobals->curtime;
 		g_SniperBot.bWasAlive = true;
+		g_SniperBot.bHasHeldAction = false;
+		g_SniperBot.flNextPolicyTime = 0.0f;
 	}
 
-	float obs[SniperPolicy::kObsSize];
-	BuildObservation( pBot, pOpponent, g_SniperBot.flAliveSince, obs );
+	// Re-evaluate the policy on the schedule it was trained at, and hold the
+	// action in between -- see POLICY_DECISIONS_PER_SECOND. ApplyAction still
+	// runs every tick, so the analytic aim stays smooth at the full tick rate;
+	// only the learned half is rate-limited.
+	if ( !g_SniperBot.bHasHeldAction || gpGlobals->curtime >= g_SniperBot.flNextPolicyTime )
+	{
+		float obs[SniperPolicy::kObsSize];
+		BuildObservation( pBot, pOpponent, g_SniperBot.flAliveSince, obs );
 
-	float action[SniperPolicy::kActionSize];
-	SniperPolicy::Forward( obs, action );
+		// Stochastic on purpose -- this samples from the Gaussian PPO trained,
+		// rather than running the network mean. Running the mean is what made the
+		// deployed bot hold its fire forever despite training win rates above
+		// 90%; see the comment on Forward() in tf_sniper_policy.h.
+		SniperPolicy::Forward( obs, g_SniperBot.flHeldAction, /*bStochastic=*/true );
+		g_SniperBot.bHasHeldAction = true;
+		g_SniperBot.flNextPolicyTime = gpGlobals->curtime + 1.0f / POLICY_DECISIONS_PER_SECOND;
 
-	DebugPrintTick( pBot, pOpponent, obs, action );
+		DebugPrintTick( pBot, pOpponent, obs, g_SniperBot.flHeldAction );
+	}
 
-	ApplyAction( pBot, pOpponent, action );
+	ApplyAction( pBot, pOpponent, g_SniperBot.flHeldAction );
 }
 
 CON_COMMAND_F( bot_rl_solo, "Spawn (or restart) the trained-policy sniper bot on RED. Join BLU as a human to fight it.", FCVAR_CHEAT )

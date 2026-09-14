@@ -82,8 +82,48 @@ PLAYER_COLLISION_RADIUS = 24.0
 MAX_EPISODE_STEPS = 300
 
 # how far a full-strength (1.0) action value moves/turns an agent in one step
-MAX_MOVE_PER_STEP = 20.0   # hammer units
+MAX_MOVE_PER_STEP = 20.0   # hammer units -- 20 * 15 steps/sec = 300 u/s, TF2 Sniper base speed
+
+# 2026-09-11: scoping now costs movement speed, as it does in TF2 (a zoomed
+# Sniper drops from 300 u/s to 80). The sim had NO cost for scoping at all --
+# _move_agent used the full speed regardless -- while SCOPE_SHAPING_SCALE
+# actively paid for it. Scoping was therefore free upside, so the policy learned
+# to hold the scope essentially always: 96-98% of ticks across every difficulty
+# in eval_policy.py.
+#
+# In the actual game that is the single worst habit it could have. MaxSpeed() is
+# really reduced when zoomed, so the deployed bot crawled around the map at a
+# quarter speed the sim never charged it for, permanently exposed and unable to
+# rotate or break line of sight. Live play confirmed it: "he loves to scope. A
+# LOT. it slows his movespeed down and makes him vulnerable."
+#
+# This makes the tradeoff real -- scope for the headshot, pay for it in mobility
+# -- which is the actual decision a Sniper makes and the thing the policy should
+# be learning instead of being handed for free.
+SCOPED_MOVE_SPEED_FRACTION = 80.0 / 300.0
 MAX_TURN_PER_STEP_DEG = 15.0
+
+# 2026-09-10: the AGENT no longer steers its own view -- aim is computed
+# analytically toward the opponent, here and in tf_sniper_bot.cpp's ApplyAction,
+# and action[2] is ignored on both sides.
+#
+# This exists to make training match deployment. Aiming was moved into the C++
+# bridge after two 50M-step runs failed to learn it (it is one line of
+# trigonometry, and a 2D toy env cannot cover the state space the real game
+# presents -- see that file's AIM_* comment). But while the sim still let the
+# policy steer, training was optimizing positioning for a world with unreliable
+# aim and then deploying into one with perfect aim, which is the same
+# sim-to-real mismatch that has burned this project repeatedly. Now both sides
+# aim the same way, so what the policy learns about positioning is learned under
+# the aim it will actually have.
+#
+# Values mirror the bridge's AIM_* constants. The sim runs at
+# MAX_EPISODE_STEPS/EPISODE_DURATION = 15 steps/sec, so the bridge's
+# 220 deg/sec slew is 220/15 ~= 14.7 deg per step.
+AIM_SLEW_DEG_PER_STEP = 14.7
+AIM_ERROR_UNITS = 6.0      # settle offset, in world units at the target
+AIM_SETTLE_UNITS = 14.0    # counts as on-target for the fire gate, same units
+MIN_CHARGE_TO_FIRE = 0.15  # clears the engine's post-zoom crit lockout
 
 FULL_CHARGE_STEPS = 30  # steps of holding scope to reach full (1.0) charge
 
@@ -530,6 +570,11 @@ class SniperDuelEnv(gym.Env):
         self._self_fire_cooldown = 0
         self._opponent_fire_cooldown = 0
 
+        # analytic-aim state, see AIM_SLEW_DEG_PER_STEP
+        self._had_los_last_step = False
+        self._aim_error_units = 0.0
+        self._aim_settle_tolerance_deg = 0.0
+
         self._step_count = 0
 
         # see OPPONENT_STYLES comment above -- picked fresh each episode so
@@ -558,22 +603,55 @@ class SniperDuelEnv(gym.Env):
         info = {}
         return observation, info
 
-    def _move_agent(self, pos, angle, action):
+    def _move_agent(self, pos, angle, action, turn_override=None, scope_active=False):
         yaw_rad = np.radians(angle)
         forward = np.array([np.cos(yaw_rad), np.sin(yaw_rad)], dtype=np.float32)
         right = np.array([np.sin(yaw_rad), -np.cos(yaw_rad)], dtype=np.float32)
 
         strafe, fwd_back = action[0], action[1]
-        move = (strafe * right + fwd_back * forward) * MAX_MOVE_PER_STEP
+        # see SCOPED_MOVE_SPEED_FRACTION -- a zoomed Sniper is much slower, and
+        # the sim used to ignore that entirely
+        speed = MAX_MOVE_PER_STEP
+        if scope_active:
+            speed *= SCOPED_MOVE_SPEED_FRACTION
+        move = (strafe * right + fwd_back * forward) * speed
         new_pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
 
         if self._point_in_any_barrier(new_pos, padding=PLAYER_COLLISION_RADIUS):
             new_pos = pos  # movement blocked by cover, stay put
 
-        angle = angle + action[2] * MAX_TURN_PER_STEP_DEG
+        # turn_override is the analytic aim delta in degrees (see
+        # AIM_SLEW_DEG_PER_STEP). The scripted opponent still steers itself via
+        # action[2]; the agent's action[2] is ignored, matching the bridge.
+        if turn_override is None:
+            angle = angle + action[2] * MAX_TURN_PER_STEP_DEG
+        else:
+            angle = angle + turn_override
         angle = ((angle + 180.0) % 360.0) - 180.0  # wrap to [-180, 180]
 
         return new_pos, angle
+
+    def _analytic_aim_turn(self, pos, angle, target_pos, has_los, error_units):
+        """Slew-limited turn toward the target, mirroring ApplyAction's aim.
+
+        Returns (turn_degrees_this_step, settle_tolerance_deg). The tolerance is
+        derived from a LINEAR size at the target rather than a fixed angle:
+        a player is only ~49 units wide, so a constant angular tolerance is a
+        guaranteed miss at long range and meaninglessly loose up close.
+        """
+        if not has_los:
+            return 0.0, 0.0
+
+        to_target = target_pos - pos
+        distance = max(float(np.linalg.norm(to_target)), 1.0)
+        bearing = np.degrees(np.arctan2(to_target[1], to_target[0]))
+        # the settle offset is a linear miss distance, converted for this range
+        bearing += np.degrees(np.arctan(error_units / distance))
+
+        delta = ((bearing - angle + 180.0) % 360.0) - 180.0
+        turn = float(np.clip(delta, -AIM_SLEW_DEG_PER_STEP, AIM_SLEW_DEG_PER_STEP))
+        tolerance = float(np.degrees(np.arctan(AIM_SETTLE_UNITS / distance)))
+        return turn, tolerance
 
     def _update_scope(self, scope_active, scope_charge, action):
         scoping_now = action[3] > 0.0
@@ -656,6 +734,30 @@ class SniperDuelEnv(gym.Env):
         if cooldown > 0:
             return 0.0, cooldown - 1, False
         if fire_signal <= 0.0:
+            return 0.0, 0, False
+        # 2026-09-12: a trigger pull that isn't a real shot no longer spends the
+        # cooldown. This is bridge parity, and the sim was the side that was
+        # wrong.
+        #
+        # tf_sniper_bot.cpp's ApplyAction only sets IN_ATTACK when the opponent
+        # is really visible, the view has settled on them, and the scope is
+        # charged. A pull failing any of those never reaches the weapon, so in
+        # game it is a free no-op -- the rifle does not fire and no refire time
+        # is spent. Here it used to burn the full FIRE_COOLDOWN_STEPS anyway, so
+        # the policy was being taxed for something deployment ignores.
+        #
+        # Measured cost of the mismatch, over 9.8M -> 22.2M -> 29.9M steps:
+        # hit rate fell 41% -> 28% -> 18% at difficulty 0.00 and 28% -> 6% -> 9%
+        # at 1.00, charged-shot rate halved, and shots per episode doubled. At
+        # the hard difficulties the policy was pulling the trigger 2-3x more
+        # often than it even held line of sight -- firing at walls, which cost
+        # it its next 1.5 seconds every time for no possible gain. The gradient
+        # that produced was noise, and it drowned out shot selection.
+        #
+        # With the gate here matching the gate there, wasted pulls are free on
+        # both sides and the only thing the cooldown measures is real shots --
+        # which is what makes hit rate a meaningful signal again.
+        if not aimed:
             return 0.0, 0, False
 
         damage = self._resolve_fire(aimed, scope_active, scope_charge, fire_signal)
@@ -744,11 +846,30 @@ class SniperDuelEnv(gym.Env):
         action = np.asarray(action, dtype=np.float32)
         opponent_action = self._scripted_opponent_action()
 
+        # analytic aim for the agent -- action[2] is ignored, matching
+        # tf_sniper_bot.cpp's ApplyAction. See AIM_SLEW_DEG_PER_STEP.
+        pre_move_los = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
+        if pre_move_los and not self._had_los_last_step:
+            # re-roll the settle offset on each fresh target acquisition, as the
+            # bridge does, so it doesn't converge on one fixed offset
+            self._aim_error_units = float(self.np_random.uniform(-AIM_ERROR_UNITS, AIM_ERROR_UNITS))
+        self._had_los_last_step = pre_move_los
+
+        aim_turn, self._aim_settle_tolerance_deg = self._analytic_aim_turn(
+            self._self_pos, self._self_angle, self._opponent_pos,
+            pre_move_los, self._aim_error_units,
+        )
+
+        # scope state is this step's (pre-_update_scope) value on purpose: the
+        # speed penalty applies to the zoom you are ALREADY in, and a zoom toggled
+        # this step takes effect from the next one, as in game.
         self._self_pos, self._self_angle = self._move_agent(
-            self._self_pos, self._self_angle, action
+            self._self_pos, self._self_angle, action, turn_override=aim_turn,
+            scope_active=self._self_scope_active,
         )
         self._opponent_pos, self._opponent_angle = self._move_agent(
-            self._opponent_pos, self._opponent_angle, opponent_action
+            self._opponent_pos, self._opponent_angle, opponent_action,
+            scope_active=self._opponent_scope_active,
         )
 
         self._self_scope_active, self._self_scope_charge = self._update_scope(
@@ -763,15 +884,24 @@ class SniperDuelEnv(gym.Env):
         # independently) share a single, consistent source of truth per step.
         self_has_los = self._line_of_sight_clear(self._self_pos, self._opponent_pos)
         self_aim_error = self._aim_error_deg(self._self_pos, self._self_angle, self._opponent_pos)
-        self_aimed = self_has_los and self_aim_error <= AIM_TOLERANCE_DEG
+        # distance-aware on-target test, matching the bridge's fire gate. The old
+        # fixed AIM_TOLERANCE_DEG is still what the scripted opponent uses.
+        self_aimed = self_has_los and self_aim_error <= self._aim_settle_tolerance_deg
 
         opponent_has_los = self._line_of_sight_clear(self._opponent_pos, self._self_pos)
         opponent_aimed = opponent_has_los and self._is_on_target(self._opponent_pos, self._opponent_angle, self._self_pos)
 
         # symmetric -- both sides pay the same FIRE_COOLDOWN_STEPS. See its
         # comment above for why symmetry is the whole point here.
+        # the agent must be scoped and past MIN_CHARGE_TO_FIRE, exactly as the
+        # bridge requires -- the engine only grants a headshot crit while zoomed
+        # and at least 0.2s after the zoom began. Without this the sim would let
+        # it body-shot freely while the real bot cannot, and the policy would
+        # learn trigger habits that don't transfer.
+        self_may_fire = (self._self_scope_active
+                         and self._self_scope_charge >= MIN_CHARGE_TO_FIRE)
         damage_to_opponent, self._self_fire_cooldown, self_shot_taken = self._try_fire(
-            self._self_fire_cooldown, self_aimed,
+            self._self_fire_cooldown, self_aimed and self_may_fire,
             self._self_scope_active, self._self_scope_charge, action[4],
         )
         damage_to_self, self._opponent_fire_cooldown, opponent_shot_taken = self._try_fire(

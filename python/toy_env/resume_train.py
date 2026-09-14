@@ -48,6 +48,21 @@ CHECKPOINT_PATTERN = re.compile(r"sniper_duel_ppo_(\d+)_steps\.zip$")
 # late training should be refining, not taking full-size steps.
 TARGET_KL = 0.03
 FINE_TUNE_LEARNING_RATE = 1e-4
+BASE_LEARNING_RATE = 3e-4       # train.py's rate, for a resume that is still mid-run
+
+# 2026-09-12: the reduced learning rate is applied only when resuming LATE.
+#
+# The collapse it was written for happened past 30M steps, to a policy that was
+# already nearly deterministic and needed refining rather than exploring. Below
+# that, a resume is just the same run continuing -- most of training is still
+# ahead of it -- and running that stretch at a third of the normal rate would
+# slow real learning to buy insurance against a failure mode that only shows up
+# once the policy has converged.
+#
+# target_kl stays on regardless: it costs nothing while updates are healthy
+# (SB3 only acts on it when measured KL actually exceeds the threshold) and it
+# is the piece that directly prevents the blow-up.
+FINE_TUNE_AFTER_STEPS = 25_000_000
 
 
 def find_latest_checkpoint():
@@ -112,8 +127,11 @@ def main():
 
     # see TARGET_KL above -- guards against the destructive-update collapse.
     model.target_kl = TARGET_KL
-    model.learning_rate = FINE_TUNE_LEARNING_RATE
-    model.lr_schedule = lambda _progress_remaining: FINE_TUNE_LEARNING_RATE
+    # see FINE_TUNE_AFTER_STEPS -- only drop the rate once the policy is far
+    # enough along that a resume is fine-tuning rather than still training.
+    lr = FINE_TUNE_LEARNING_RATE if step_count >= FINE_TUNE_AFTER_STEPS else BASE_LEARNING_RATE
+    model.learning_rate = lr
+    model.lr_schedule = lambda _progress_remaining: lr
 
     # PPO.load restores verbose from the checkpoint, and these checkpoints carry
     # verbose=0 from the behavior-cloning warm start -- which is why the run
@@ -121,7 +139,8 @@ def main():
     # wasn't noticed until a checkpoint was evaluated by hand.
     model.verbose = 1
     model.set_logger(configure(None, ["stdout"]))
-    print(f"[resume] target_kl={TARGET_KL}, lr={FINE_TUNE_LEARNING_RATE}")
+    print(f"[resume] target_kl={TARGET_KL}, lr={lr}"
+          f"{' (fine-tune)' if lr == FINE_TUNE_LEARNING_RATE else ' (still mid-run)'}")
 
     # seed the opponent curriculum back to where it actually was -- workers
     # are fresh processes with difficulty=0.0 by default otherwise, which
