@@ -30,12 +30,23 @@ OBS_KEY_ORDER = [
 ]
 
 
-def main():
-    # optional argv override so a specific snapshot can be exported without
-    # first having to shuffle files into models/sniper_duel_ppo.zip -- handy for
-    # deploying a mid-run checkpoint while training continues.
-    model_path = sys.argv[1] if len(sys.argv) > 1 else MODEL_PATH
-    print(f"exporting from {model_path}")
+# 2026-09-13: the DLL can carry several policies at once, selected in game by
+# the sniperbot_policy convar. This exists for showing the bot's progression --
+# an early checkpoint and a late one behave visibly differently (the 500k-step
+# policy holds its scope on ~90% of ticks and crawls; the 50M one scopes on
+# ~55% and sprints between engagements).
+#
+# It is NOT a difficulty setting. Measured win rates at 500k vs 50M steps are
+# 92/68/48 vs 98/78/68 across difficulties 0.00/0.50/1.00 -- the warm start from
+# behavior cloning means even a barely-trained policy duels competently. What
+# actually makes the bot easy or hard to fight is the analytic aim, which was
+# never learned; see sniperbot_aim_skill in tf_sniper_bot.cpp.
+DEFAULT_VARIANTS = ("default",)
+
+
+def extract_policy(model_path):
+    """Pull the weights and action std out of one saved model."""
+    print(f"  reading {model_path}")
     model = PPO.load(model_path)
     policy_net = model.policy.mlp_extractor.policy_net
     action_net = model.policy.action_net
@@ -72,8 +83,10 @@ def main():
     # So the std ships with the weights, and the C++ side samples (see
     # SniperPolicy::Forward's bStochastic argument).
     log_std = model.policy.log_std.detach().numpy()
-    export = {
-        "obs_key_order": OBS_KEY_ORDER,
+    print("    action std: " + ", ".join(
+        f"{n}={v:.3f}" for n, v in zip(
+            ("strafe", "fwd", "turn", "scope", "fire"), np.exp(log_std))))
+    return {
         "action_low": model.action_space.low.tolist(),
         "action_high": model.action_space.high.tolist(),
         "log_std": log_std.tolist(),
@@ -81,13 +94,76 @@ def main():
         "layers": layers,
     }
 
+
+def main():
+    """Export one or more policies into a single JSON.
+
+        python export_policy.py                          # models/sniper_duel_ppo
+        python export_policy.py path/to/model.zip        # one specific model
+        python export_policy.py early=a.zip late=b.zip   # several, named
+
+    The named form is what feeds the in-game sniperbot_policy convar; names
+    become the values that convar accepts. Order is preserved, and index 0 is
+    what the bot uses by default.
+    """
+    args = sys.argv[1:]
+    if not args:
+        specs = [("default", MODEL_PATH)]
+    elif all("=" in a for a in args):
+        specs = [(a.split("=", 1)[0], a.split("=", 1)[1]) for a in args]
+    elif len(args) == 1:
+        specs = [("default", args[0])]
+    else:
+        raise SystemExit(
+            "pass either a single model path, or several as name=path pairs "
+            "(e.g. early=snapshots/a.zip late=models/sniper_duel_ppo.zip)")
+
+    seen = set()
+    for name, _ in specs:
+        if not name.replace("_", "").isalnum():
+            raise SystemExit(f"variant name {name!r} must be alphanumeric/underscore "
+                             "-- it becomes a C++ identifier and a convar value")
+        if name in seen:
+            raise SystemExit(f"duplicate variant name {name!r}")
+        seen.add(name)
+
+    print(f"exporting {len(specs)} policy variant(s)")
+    variants = []
+    for name, path in specs:
+        print(f"  [{name}]")
+        entry = extract_policy(path)
+        entry["name"] = name
+        entry["source"] = os.path.basename(str(path))
+        variants.append(entry)
+
+    # every variant shares one architecture and one observation layout -- the
+    # C++ side has a single Forward() and a single BuildObservation, so a
+    # mismatch here would be silently wrong rather than a build error.
+    shapes = {tuple(len(l["weight"]) for l in v["layers"]) for v in variants}
+    if len(shapes) != 1:
+        raise SystemExit(f"variants have different layer shapes {shapes} -- "
+                         "they must all come from the same architecture")
+
+    export = {
+        "obs_key_order": OBS_KEY_ORDER,
+        # top-level copies of the first variant keep the single-policy consumers
+        # (verify_export.py, anything reading this file directly) working
+        # unchanged rather than forcing every reader to learn about variants.
+        "action_low": variants[0]["action_low"],
+        "action_high": variants[0]["action_high"],
+        "log_std": variants[0]["log_std"],
+        "action_std": variants[0]["action_std"],
+        "layers": variants[0]["layers"],
+        "variants": variants,
+    }
+
     with open(EXPORT_PATH, "w") as f:
         json.dump(export, f)
 
-    print(f"exported policy to {EXPORT_PATH}")
-    print("  action std: " + ", ".join(
-        f"{n}={v:.3f}" for n, v in zip(
-            ("strafe", "fwd", "turn", "scope", "fire"), np.exp(log_std))))
+    print()
+    print(f"exported to {EXPORT_PATH}")
+    for i, v in enumerate(variants):
+        print(f"  [{i}] {v['name']:<10} <- {v['source']}")
 
 
 if __name__ == "__main__":

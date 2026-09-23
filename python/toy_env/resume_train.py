@@ -25,7 +25,9 @@ N_ENVS = 8
 
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "snapshots")
-FINAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_ppo")
+# must match train.py -- a resumed run is the same run, and has to land in the
+# same file rather than overwriting an unrelated (possibly deployed) model
+FINAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_ppo_varied")
 TENSORBOARD_LOG_DIR = os.path.join(SCRIPT_DIR, "tb_logs")
 TENSORBOARD_RUN_NAME = f"ppo_sniper_duel_resume_{time.strftime('%Y%m%d_%H%M%S')}"
 

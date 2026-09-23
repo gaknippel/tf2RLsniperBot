@@ -28,12 +28,32 @@ TOTAL_TIMESTEPS = 50_000_000  # 2026-08-25: sized for an overnight run (~8h at t
 CHUNK_TIMESTEPS = 100_000  # checkpoint + curriculum-update interval
 N_ENVS = 8  # matches this machine's logical core count
 
+# 2026-09-16: SB3 abandons the rest of an epoch's updates once measured KL passes
+# this. Without it a fresh run is unguarded against the destructive-update mode
+# that has now bitten this project twice.
+#
+# The failure is specific: once the policy is near-deterministic, PPO's
+# importance ratios explode on small mean shifts, clipping stops protecting the
+# update, and a single bad batch can flatten a working policy. One earlier run
+# lost a 90%-winning policy that way between 30M and 43M steps. On the run that
+# produced the current model, approx_kl was measured at 1.08 and 0.70 against a
+# normal 0.01-0.03, with 61 of 2600 updates over 0.5 -- and once the guard was
+# switched on for the last stretch it fired 187 times in 3M steps. Those were
+# real updates being rejected, not a theoretical risk.
+#
+# It costs nothing while updates are healthy: the threshold is only consulted
+# after an epoch's KL is already measured, so well-behaved training is untouched.
+TARGET_KL = 0.03
+
 # anchor output paths to this script's own folder, not the caller's cwd, so
 # `python train.py` and `python toy_env/train.py` (run from elsewhere) both
 # save to the same place.
 SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))
 CHECKPOINT_DIR = os.path.join(SCRIPT_DIR, "snapshots")
-FINAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_ppo")
+# 2026-09-19: separate file so a run in progress can never overwrite the model
+# that is currently deployed and verified. The wide-spawn policy ships as its own
+# variant alongside the old one, not in place of it.
+FINAL_MODEL_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_ppo_varied")
 PRETRAINED_PATH = os.path.join(SCRIPT_DIR, "models", "sniper_duel_pretrained")
 TENSORBOARD_LOG_DIR = os.path.join(SCRIPT_DIR, "tb_logs")
 # timestamped so each script execution gets its own run folder -- SB3 reuses
@@ -116,6 +136,9 @@ def main():
         print(f"[train] warm-starting from {PRETRAINED_PATH}.zip")
         model = PPO.load(PRETRAINED_PATH, env=vec_env, tensorboard_log=TENSORBOARD_LOG_DIR)
         model.ent_coef = 0.0
+        # see TARGET_KL -- a warm-started model carries the checkpoint's value,
+        # which is None for anything saved before this guard existed
+        model.target_kl = TARGET_KL
         # PPO.load restores verbose from the saved model, and pretrain_policy.py
         # builds its throwaway model with verbose=0 -- without this the whole
         # run prints curriculum lines and no rollout/train tables at all.
@@ -123,7 +146,8 @@ def main():
         model.set_logger(configure(None, ["stdout"]))
     else:
         print("[train] no pretrained policy found, training from scratch")
-        model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.0, tensorboard_log=TENSORBOARD_LOG_DIR)
+        model = PPO("MultiInputPolicy", vec_env, verbose=1, ent_coef=0.0,
+                    target_kl=TARGET_KL, tensorboard_log=TENSORBOARD_LOG_DIR)
 
     callback = CallbackList([
         DifficultyCurriculumCallback(TOTAL_TIMESTEPS, update_freq=CHUNK_TIMESTEPS),

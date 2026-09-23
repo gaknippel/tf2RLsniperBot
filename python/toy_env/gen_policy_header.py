@@ -41,7 +41,14 @@ def main():
     with open(POLICY_JSON_PATH) as f:
         policy = json.load(f)
 
-    layers = policy["layers"]
+    # variants: several policies baked into one header, picked in game by the
+    # sniperbot_policy convar. Files predating that carry a single top-level
+    # policy, which is treated as one unnamed variant so old exports still build.
+    variants = policy.get("variants")
+    if not variants:
+        variants = [dict(policy, name="default", source="(single-policy export)")]
+
+    layers = variants[0]["layers"]
     obs_size = len(layers[0]["weight"][0])
     action_size = len(layers[-1]["weight"])
 
@@ -62,34 +69,49 @@ def main():
     lines.append(f"\tconst int kLayerCount = {len(layers)};")
     lines.append("")
 
+    lines.append(f"\tconst int kVariantCount = {len(variants)};")
+    lines.append("\t// Policy variants, in the order export_policy.py was given them.")
+    lines.append("\t// Index 0 is the default. The names are what sniperbot_policy accepts.")
+    for vi, v in enumerate(variants):
+        lines.append(f"\t// [{vi}] {v['name']} <- {v['source']}")
+    lines.append("")
+
+    # Weights and std are emitted with a leading [kVariantCount] dimension so
+    # every variant shares one set of shape constants and one Forward(). Shapes
+    # are taken from variant 0 and asserted equal in export_policy.py.
     for i, layer in enumerate(layers):
-        w = layer["weight"]  # [out][in]
-        b = layer["bias"]
-        out_dim = len(w)
-        in_dim = len(w[0])
+        out_dim = len(layer["weight"])
+        in_dim = len(layer["weight"][0])
         activation = layer["activation"]  # "tanh" or "none"
 
         lines.append(f"\t// layer {i}: Linear({in_dim} -> {out_dim}), activation = {activation}")
         lines.append(f"\tconst int kLayer{i}InputSize = {in_dim};")
         lines.append(f"\tconst int kLayer{i}OutputSize = {out_dim};")
         lines.append(f"\tconst bool kLayer{i}Tanh = {'true' if activation == 'tanh' else 'false'};")
-        lines.append(f"\tconst float kLayer{i}Weight[{out_dim}][{in_dim}] =")
+
+        lines.append(f"\tconst float kLayer{i}Weight[{len(variants)}][{out_dim}][{in_dim}] =")
         lines.append("\t{")
-        lines.append(format_matrix(w, indent="\t\t"))
+        for v in variants:
+            lines.append(f"\t\t{{ // {v['name']}")
+            lines.append(format_matrix(v["layers"][i]["weight"], indent="\t\t\t"))
+            lines.append("\t\t},")
         lines.append("\t};")
-        lines.append(f"\tconst float kLayer{i}Bias[{out_dim}] =")
+
+        lines.append(f"\tconst float kLayer{i}Bias[{len(variants)}][{out_dim}] =")
         lines.append("\t{")
-        lines.append(format_float_array(b, indent="\t\t"))
+        for v in variants:
+            lines.append("\t\t{ " + ", ".join(
+                format_float(x) for x in v["layers"][i]["bias"]) + f" }}, // {v['name']}")
         lines.append("\t};")
         lines.append("")
 
     lines.append(f"\tconst float kActionLow[{action_size}] =")
     lines.append("\t{")
-    lines.append(format_float_array(policy["action_low"], indent="\t\t"))
+    lines.append(format_float_array(variants[0]["action_low"], indent="\t\t"))
     lines.append("\t};")
     lines.append(f"\tconst float kActionHigh[{action_size}] =")
     lines.append("\t{")
-    lines.append(format_float_array(policy["action_high"], indent="\t\t"))
+    lines.append(format_float_array(variants[0]["action_high"], indent="\t\t"))
     lines.append("\t};")
     lines.append("")
     lines.append("\t// obs_key_order from export_policy.py, for reference when building the")
@@ -98,21 +120,32 @@ def main():
     # PPO emits a MEAN; the behaviour that got optimised is a sample from
     # N(mean, std). Shipping weights without the std deploys a different agent
     # than the one trained -- see the long note in export_policy.py.
-    action_std = policy.get("action_std")
-    if action_std is None:
-        raise SystemExit(
-            "policy JSON has no 'action_std' -- re-run export_policy.py. The std is "
-            "required: without it the DLL runs the deterministic policy, whose fire "
-            "output never crosses its threshold (see export_policy.py).")
+    for v in variants:
+        if v.get("action_std") is None:
+            raise SystemExit(
+                f"variant {v['name']!r} has no 'action_std' -- re-run export_policy.py. "
+                "The std is required: without it the DLL runs the deterministic policy, "
+                "whose fire output never crosses its threshold (see export_policy.py).")
     lines.append("\t// Per-dimension Gaussian std from training. The action the policy")
     lines.append("\t// actually takes is a SAMPLE from N(mean, std), not the mean: the")
     lines.append("\t// fire dimension's mean never crosses its threshold, so a mean-only")
     lines.append("\t// bot never shoots. See export_policy.py for the measurements.")
-    lines.append(f"\tconst float kActionStd[{action_size}] =")
+    lines.append(f"\tconst float kActionStd[{len(variants)}][{action_size}] =")
     lines.append("\t{")
-    lines.append(format_float_array(action_std, indent="\t\t"))
+    for v in variants:
+        lines.append("\t\t{ " + ", ".join(
+            format_float(x) for x in v["action_std"]) + f" }}, // {v['name']}")
     lines.append("\t};")
     lines.append("")
+
+    # Names as a C string table so the convar can be set by name rather than by
+    # a magic index -- "sniperbot_policy late" beats "sniperbot_policy 2".
+    lines.append(f"\tconst char * const kVariantNames[{len(variants)}] =")
+    lines.append("\t{")
+    lines.append("\t\t" + ", ".join(f'"{v["name"]}"' for v in variants))
+    lines.append("\t};")
+    lines.append("")
+
     for key in policy["obs_key_order"]:
         lines.append(f"\t// - {key}")
     lines.append("}")

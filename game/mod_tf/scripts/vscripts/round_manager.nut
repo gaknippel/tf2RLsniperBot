@@ -1,11 +1,17 @@
 // simple 1v1 duel round controller for aiMod / mod_tf
 //
-// attach this to a logic_script entity in hammer:
+// attach this to a logic_script entity in hammer.
+//
+// Endless duel: every death resets both players and the score carries on
+// forever, posted to chat after each round. There is no match end -- reload the
+// map to zero the score.
+//
+// Only VScript methods this build actually binds are used here. GetPlayerName
+// is NOT exposed to script in this SDK (C++-only), and calling it threw a
+// Squirrel error that killed ResetRound mid-loop and left players stuck in the
+// air -- so rounds are reported by team, not by name.
 
-// round stuff
-MAX_ROUNDS <- 10
 roundNumber <- 0
-matchOver <- false
 redWins <- 0
 bluWins <- 0
 
@@ -21,11 +27,13 @@ function GetSpawnPoint(teamNum)
 }
 
 // round reset
+//
+// tf_sniper_bot.cpp relies on this exact behaviour: everyone force-respawned
+// and pinned to their team's spawn entity. The bot detects the respawn on the
+// following tick and applies its own spawn spread after this has run, so keep
+// the respawn/teleport here even though the bot overrides its own position.
 function ResetRound()
 {
-    if (matchOver)
-        return
-
     local player = null
     while ((player = Entities.FindByClassname(player, "player")) != null)
     {
@@ -36,7 +44,6 @@ function ResetRound()
         if (team != 2 && team != 3)
             continue // skip spectators/unassigned
 
-        // force respawn
         player.ForceRespawn()
 
         local spawn = GetSpawnPoint(team)
@@ -49,8 +56,11 @@ function ResetRound()
         //full heal just like in MGE
         player.SetHealth(player.GetMaxHealth())
     }
+}
 
-    local msg = "=== Round " + roundNumber + " reset. RED: " + redWins + " BLU: " + bluWins + " ==="
+function PostScore(roundWinner)
+{
+    local msg = "Round " + roundNumber + ": " + roundWinner + "  |  RED " + redWins + " - " + bluWins + " BLU"
     printl(msg)
     Say(null, msg, false)
 }
@@ -58,46 +68,32 @@ function ResetRound()
 // on death
 function OnGameEvent_player_death(params)
 {
-    if (matchOver)
-        return
-
     local victim = GetPlayerFromUserID(params.userid)
     local attacker = GetPlayerFromUserID(params.attacker)
 
+    roundNumber += 1
+
+    local roundWinner = "no point (suicide/world)"
     if (attacker != null && victim != null && attacker != victim)
     {
         if (attacker.GetTeam() == 2)
+        {
             redWins += 1
+            roundWinner = "RED wins"
+        }
         else if (attacker.GetTeam() == 3)
+        {
             bluWins += 1
+            roundWinner = "BLU wins"
+        }
     }
 
-    roundNumber += 1
-
-    if (roundNumber >= MAX_ROUNDS)
-    {
-        EndMatch()
-        return
-    }
+    PostScore(roundWinner)
 
     //create a little delay
     local reset = function() { ResetRound() }.bindenv(this)
     CreateScheduleEvent(1.0, reset)
 }
-
-// match end
-function EndMatch()
-{
-    matchOver = true
-    local winner = "TIE"
-    if (redWins > bluWins) winner = "RED"
-    else if (bluWins > redWins) winner = "BLU"
-
-    local msg = "=== match over! === RED: " + redWins + "  BLU: " + bluWins + "  WINNER: " + winner
-    Say(null, msg, false)
-}
-
-
 
 
 scheduledEvents <- []
@@ -129,15 +125,25 @@ function Init()
 {
     __CollectGameEventCallbacks(this)
 
+    // SendToServerConsole, NOT SendToConsole. SendToConsole delivers to
+    // "the listen server host", which the engine takes to mean player slot 1 --
+    // and SourceTV (tv_enable 1) joins first and occupies slot 1. Both commands
+    // below were being sent to SourceTV's console, a fake client that ignores
+    // them: 1v1map.cfg never ran and the bot never spawned. Server-console
+    // commands don't depend on slot order. On a listen server they share the
+    // local command buffer, so the binds in 1v1map.cfg still apply.
+    //
+    // Requires sv_allow_point_servercommand always (set in autoexec.cfg);
+    // otherwise TF only permits this on official Valve maps and it does nothing.
 
     //force custom cfg for 1v1 map
-    SendToConsole("exec 1v1map")
+    SendToServerConsole("exec 1v1map")
 
     //spawns the trained-policy RL sniper bot on RED (see tf_sniper_bot.cpp)
     //not the official valve bot with nextbot ai -- join BLU to fight it
-    CreateScheduleEvent(1.0, function() { SendToConsole("bot_rl_solo") })
+    CreateScheduleEvent(1.0, function() { SendToServerConsole("bot_rl_solo") })
 
-    printl("=== round_manager.nut loaded. max rounds: " + MAX_ROUNDS + " ===")
+    printl("=== round_manager.nut loaded. endless duel, score in chat ===")
 }
 
 Init()

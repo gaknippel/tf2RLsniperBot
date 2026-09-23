@@ -90,10 +90,140 @@ static const float EPISODE_DURATION_SECONDS = 20.0f;
 // "pixels off" at distance. Converting a linear tolerance into an angle per
 // tick (atan(units / distance)) makes it tight at long range and forgiving
 // close up, which is both more accurate and more human.
-static const float AIM_SLEW_DEG_PER_SEC = 220.0f;
-static const float AIM_ERROR_UNITS = 6.0f;
-static const float AIM_SETTLE_UNITS = 14.0f;
+// The slew rate / aim error / settle tolerance that used to live here as fixed
+// constants are now the "medium" row of g_AimSkills below, so they can be
+// swapped at runtime. Only the charge threshold is still fixed: it is the
+// engine's post-zoom crit lockout, not a tuning choice.
 static const float AIM_MIN_CHARGE_TO_FIRE = 0.15f;
+
+// ---------------------------------------------------------------------------
+// Difficulty.
+//
+// This lives in the AIM, not in the policy, and that is a deliberate choice
+// backed by measurement rather than a shortcut.
+//
+// Swapping policy checkpoints does NOT produce an easy/medium/hard ladder. A
+// 500k-step checkpoint and the final 50M one win 92/68/48 and 98/78/68 percent
+// across sim difficulties 0.00/0.50/1.00 -- close enough that a player would
+// not reliably tell them apart in a duel, because the behavior-cloning warm
+// start means even a barely-trained policy fights competently. What the
+// checkpoints actually differ in is habits (the early one holds its scope on
+// ~90% of ticks and crawls; the late one scopes on ~55% and sprints), which is
+// worth showing off but is not difficulty. That selection is sniperbot_policy.
+//
+// Aiming was never learned -- it is analytic code right here -- so it is the
+// honest and precise place to put a difficulty knob. Three numbers control how
+// hard the bot is to fight:
+//
+//   slew    how fast it can swing onto a target; low values give a human the
+//           time to react and break the angle first
+//   error   the steady-state offset it settles on, in world units at the
+//           target; a player is only ~49 units wide, so this is the difference
+//           between a headshot and a graze
+//   settle  how close it must be before the fire gate opens
+//
+struct AimSkill_t
+{
+	const char *pszName;
+	float flSlewDegPerSec;
+	float flErrorUnits;
+	float flSettleUnits;
+};
+
+static const AimSkill_t g_AimSkills[] =
+{
+	// deliberately clumsy: slow to swing on, settles nearly a body-width off
+	{ "easy",   70.0f,  26.0f, 34.0f },
+	// the values everything was tuned and tested against
+	{ "medium", 220.0f,  6.0f, 14.0f },
+	// snaps on and settles inside a head: this one is not meant to be fair
+	{ "hard",   520.0f,  1.5f,  6.0f },
+};
+static const int kAimSkillCount = ARRAYSIZE( g_AimSkills );
+
+static ConVar sniperbot_aim_skill( "sniperbot_aim_skill", "medium", FCVAR_CHEAT,
+	"How hard the RL sniper bot is to fight: easy, medium, or hard. Controls the "
+	"analytic aim (slew rate, settle error), which is what actually makes the bot "
+	"easy or hard -- NOT sniperbot_policy, which only swaps which trained brain "
+	"drives movement and shot selection." );
+
+// ---------------------------------------------------------------------------
+// Opening variety.
+//
+// The bot takes the same line off spawn nearly every round, and this cannot be
+// fixed by varying its starting state -- that was measured, after three failed
+// attempts at exactly that. At the deployment spawn the policy's MEAN strafe is
+// +1.16 against an action clip of +1.00, i.e. already saturated:
+//
+//   sampling noise (std 0.49) sends only 0.97% of draws left
+//   t_left from 1.0 to 0.2    changes the action not at all
+//   spawn position +/-40u     moves mean strafe to +1.01..+1.33, still saturated
+//
+// So the route is not a preference the bridge can nudge, it is a converged
+// optimum: from that whole region of state space, hard right is the best opening
+// this policy knows. Genuinely fixing it means retraining against something that
+// punishes predictability.
+//
+// This is the cheap alternative, and it is honest about what it is: for the
+// first OPENING_DURATION_SECONDS of a round, the strafe axis is mirrored on a
+// random fraction of rounds, sending the bot down the opposite line before the
+// policy takes over again. It is a puppet string, not learned behaviour.
+//
+// Defaults to 0 (off), so a build with this compiled in behaves identically to
+// one without it until someone opts in.
+static const float OPENING_DURATION_SECONDS = 1.2f;
+
+
+static ConVar sniperbot_opening_variety( "sniperbot_opening_variety", "0", FCVAR_CHEAT,
+	"0-1: chance per round that the RL sniper bot mirrors its opening strafe for "
+	"the first ~1.2s, so it doesn't take the same line off spawn every round. "
+	"This is scripted, not learned -- the policy's strafe is saturated at spawn "
+	"and cannot be varied any other way. 0 = off (default), 0.5 = half of rounds.",
+	true, 0.0f, true, 1.0f );
+
+// Width of the bot's spawn along its spawn wall, in world units, matching
+// SPAWN_Y_SPREAD in sniper_duel_env.py.
+//
+// Pairs with a policy trained at the same spread -- a policy only produces
+// varied routes if it is both TRAINED on varied starts and GIVEN them. Setting
+// this for a policy trained at a fixed spawn is extrapolation, and setting it to
+// 0 for a policy trained wide throws away the variety it learned.
+//
+// Default 0 keeps the map's own spawn point, which is what every policy shipped
+// before 2026-09-19 was trained against.
+static ConVar sniperbot_spawn_spread( "sniperbot_spawn_spread", "0", FCVAR_CHEAT,
+	"World units of random spread along the RL sniper bot's spawn wall. 0 = the "
+	"map's spawn point (correct for the 'late' policy). 330 matches the spread "
+	"the 'varied' policy was trained on -- set them together or not at all.",
+	true, 0.0f, true, 400.0f );
+
+static ConVar sniperbot_policy( "sniperbot_policy", "late", FCVAR_CHEAT,
+	"Which trained policy the RL sniper bot runs: early, mid, or late. These are "
+	"checkpoints from one 50M-step run, for showing how the bot's habits evolved "
+	"(early holds its scope constantly and crawls; late sprints and scopes on "
+	"contact). They are NOT difficulty settings -- use sniperbot_aim_skill." );
+
+static const AimSkill_t &CurrentAimSkill()
+{
+	for ( int i = 0; i < kAimSkillCount; ++i )
+	{
+		if ( !Q_stricmp( sniperbot_aim_skill.GetString(), g_AimSkills[i].pszName ) )
+			return g_AimSkills[i];
+	}
+	return g_AimSkills[1]; // unrecognised -> medium, so a typo is still playable
+}
+
+static int CurrentPolicyVariant()
+{
+	for ( int i = 0; i < SniperPolicy::kVariantCount; ++i )
+	{
+		if ( !Q_stricmp( sniperbot_policy.GetString(), SniperPolicy::kVariantNames[i] ) )
+			return i;
+	}
+	// unrecognised -> the last (most trained) one rather than index 0, so a typo
+	// gives the best bot instead of silently demoting it mid-recording
+	return SniperPolicy::kVariantCount - 1;
+}
 
 // The policy was trained at 15 decisions per second (MAX_EPISODE_STEPS=300 over
 // EPISODE_DURATION_SECONDS=20 in sniper_duel_env.py) and MUST be run at that
@@ -142,14 +272,33 @@ struct SniperBotSlot_t
 	float flNextPolicyTime;
 	float flHeldAction[SniperPolicy::kActionSize];
 	bool bHasHeldAction;
+	// see sniperbot_opening_variety -- all three are inert while it is 0
+	bool bOpponentWasLive;
+	bool bBotWasLive;
+	float flOpeningEndsAt;
+	bool bMirrorOpening;
 };
 
 static SniperBotSlot_t g_SniperBot; // RED only -- see the file-header comment.
+
+// One answer shared by the movement and the debug output -- see
+// sniperbot_opening_variety. The first version mirrored the strafe in
+// ApplyAction but printed the raw action[0], so the log read strafe=1.00
+// whether or not the mirror had fired and the feature was indistinguishable
+// from a no-op.
+static bool IsMirroringOpening()
+{
+	return g_SniperBot.bMirrorOpening
+	    && gpGlobals->curtime < g_SniperBot.flOpeningEndsAt;
+}
 
 // Must match sniper_duel_env.py's SPAWN_JITTER exactly -- training added
 // this same +-40 unit random offset to the spawn every episode, so the
 // policy actually expects some position variety, not the exact spawn origin.
 static const float SPAWN_JITTER = 40.0f;
+
+
+
 
 // TF2's own spawn-point selection (run by ForceRespawn()) is what
 // round_manager.nut's ResetRound() explicitly works around every round --
@@ -163,17 +312,64 @@ static const float SPAWN_JITTER = 40.0f;
 //
 // Also jitters x/y (not z, not facing angle -- training never varied those
 // either) so the bot doesn't tele to the exact same spot life after life.
+// Is there room for this player to stand here? Same clearance test
+// CTFTeamSpawn::Activate uses on map spawn points, with the bot's own hull.
+static bool IsSpawnPositionClear( CTFPlayer *pBot, const Vector &vecPos )
+{
+	trace_t trace;
+	UTIL_TraceHull( vecPos, vecPos, pBot->GetPlayerMins(), pBot->GetPlayerMaxs(),
+	                MASK_PLAYERSOLID, pBot, COLLISION_GROUP_PLAYER_MOVEMENT, &trace );
+	return trace.fraction == 1 && trace.allsolid != 1 && trace.startsolid != 1;
+}
+
 static void PinToNamedSpawn( CTFPlayer *pBot )
 {
 	CBaseEntity *pSpawn = gEntList.FindEntityByName( NULL, "spawn_red" );
-	if ( pSpawn )
+	if ( !pSpawn )
+		return;
+
+	Vector vecSpawn = pSpawn->GetAbsOrigin();
+	vecSpawn.x += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
+	vecSpawn.y += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
+
+	// see sniperbot_spawn_spread. Candidates are rejection-sampled against the
+	// player hull so a wide spawn can't put the bot inside the map; if none of
+	// them fit, the jittered spawn point above stands.
+	float flSpread = sniperbot_spawn_spread.GetFloat();
+	if ( flSpread > 0.0f )
 	{
-		Vector vecSpawn = pSpawn->GetAbsOrigin();
-		vecSpawn.x += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
-		vecSpawn.y += RandomFloat( -SPAWN_JITTER, SPAWN_JITTER );
-		pBot->Teleport( &vecSpawn, &pSpawn->GetAbsAngles(), NULL );
+		for ( int i = 0; i < 24; ++i )
+		{
+			Vector vecTry = vecSpawn;
+			vecTry.y = pSpawn->GetAbsOrigin().y + RandomFloat( -flSpread, flSpread );
+			if ( IsSpawnPositionClear( pBot, vecTry ) )
+			{
+				vecSpawn = vecTry;
+				break;
+			}
+		}
 	}
+
+	pBot->Teleport( &vecSpawn, &pSpawn->GetAbsAngles(), NULL );
 }
+
+// 2026-09-16: three attempts to add spawn variety from this file have been
+// removed, and the note is here so a fourth doesn't get written.
+//
+// Tried, in order: randomising the facing; calling the randomisation on every
+// fresh life rather than only on bot_rl_solo (round_manager.nut re-pins the
+// position every round, so the jitter above mostly does not survive); and
+// sampling the second spawn line sniper_duel_env.py uses. Each was motivated by
+// a real sim measurement -- from the normal spawn the policy sends 96% of its
+// runs into one 45-degree wedge -- and each made the bot measurably WORSE to
+// play against, taking in-game results from competitive to 1-8 and 2-8.
+//
+// The sim stopped being able to grade this. The model deployed here scores 68%
+// against the max-difficulty scripted opponent; the model that replaced it
+// scored 100% and lost badly to a human. A saturated benchmark cannot rank two
+// policies, and route predictability is a reward-function problem that needs an
+// opponent which punishes taking the same line. It is not fixable from the
+// bridge, and attempts to force it here cost more than the predictability did.
 
 static CTFPlayer *SpawnOneSniperBot( const char *pszName )
 {
@@ -204,6 +400,16 @@ void SniperBot_SpawnSolo()
 	else
 	{
 		g_SniperBot.hBot = SpawnOneSniperBot( "jerry" );
+		if ( !g_SniperBot.hBot.Get() )
+		{
+			// This used to fail silently. The usual cause is no free player slot
+			// -- SourceTV (tv_enable 1) takes one, so a 2-player server with you
+			// and SourceTV in it has no room for the bot.
+			Warning( "[sniperbot] could not spawn jerry: no free player slot? "
+			         "maxplayers=%d. SourceTV uses a slot too -- raise maxplayers "
+			         "or set tv_enable 0.\n", gpGlobals->maxClients );
+			return;
+		}
 	}
 	g_SniperBot.flAliveSince = gpGlobals->curtime;
 	g_SniperBot.bWasAlive = true;
@@ -326,13 +532,16 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 
 	bool bOpponentVisible = pBot->FVisible( pOpponent );
 
+	// see g_AimSkills -- this is the difficulty knob (easy/medium/hard)
+	const AimSkill_t &skill = CurrentAimSkill();
+
 	// Re-roll the steady-state aim offset each time a target is reacquired, so
 	// the bot doesn't converge on the exact same offset every fight. Stored in
 	// world units at the target and converted to an angle per tick below, so it
 	// stays correct at any range -- see the AIM_* comment.
 	if ( bOpponentVisible && !g_SniperBot.bHadTargetLastTick )
 	{
-		g_SniperBot.flAimErrorOffsetUnits = RandomFloat( -AIM_ERROR_UNITS, AIM_ERROR_UNITS );
+		g_SniperBot.flAimErrorOffsetUnits = RandomFloat( -skill.flErrorUnits, skill.flErrorUnits );
 	}
 	g_SniperBot.bHadTargetLastTick = bOpponentVisible;
 
@@ -353,13 +562,13 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 		// number of world units means the same thing point-blank and across the
 		// map -- see the AIM_* comment above.
 		float flErrorDeg = RAD2DEG( atanf( g_SniperBot.flAimErrorOffsetUnits / flRange ) );
-		flSettleToleranceDeg = RAD2DEG( atanf( AIM_SETTLE_UNITS / flRange ) );
+		flSettleToleranceDeg = RAD2DEG( atanf( skill.flSettleUnits / flRange ) );
 
 		QAngle angWanted;
 		VectorAngles( vecToTarget, angWanted );
 		angWanted.y = AngleNormalize( angWanted.y + flErrorDeg );
 
-		float flMaxStep = AIM_SLEW_DEG_PER_SEC * flTurnFrametime;
+		float flMaxStep = skill.flSlewDegPerSec * flTurnFrametime;
 		float flYawDelta = AngleNormalize( angWanted.y - angViewAngles.y );
 		float flPitchDelta = AngleNormalize( angWanted.x - angViewAngles.x );
 
@@ -373,10 +582,20 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 	}
 	else
 	{
+		// 2026-09-16: reverted to simply holding the current yaw with no target.
+		//
+		// This briefly slewed toward the opponent's last known position, which
+		// measured better in the sim and looked better on paper -- the bot arrived
+		// already oriented and killed in a second. In game it was worse, and the
+		// scoreboard is what settles it. It also requires a policy trained against
+		// the same behaviour; the model deployed here was not, so the two must
+		// agree the old way.
+		//
 		// no target: let the policy's movement carry it, and keep the view level
 		// so it isn't left staring at the floor when it reacquires.
-		angViewAngles.x = Approach( 0.0f, angViewAngles.x, AIM_SLEW_DEG_PER_SEC * flTurnFrametime );
+		angViewAngles.x = Approach( 0.0f, angViewAngles.x, skill.flSlewDegPerSec * flTurnFrametime );
 	}
+
 	angViewAngles.z = 0.0f;
 
 	unsigned short usButtons = 0;
@@ -427,8 +646,12 @@ static void ApplyAction( CTFPlayer *pBot, CTFPlayer *pOpponent, const float acti
 	CUserCmd cmd;
 	Q_memset( &cmd, 0, sizeof( cmd ) );
 	VectorCopy( angViewAngles, cmd.viewangles );
+	// see sniperbot_opening_variety -- mirrors the opening line on a random
+	// fraction of rounds. Inert unless the convar is set above 0.
+	float flStrafe = IsMirroringOpening() ? -action[0] : action[0];
+
 	cmd.forwardmove = action[1] * pBot->MaxSpeed();
-	cmd.sidemove = action[0] * pBot->MaxSpeed();
+	cmd.sidemove = flStrafe * pBot->MaxSpeed();
 	cmd.upmove = 0;
 	cmd.buttons = usButtons;
 	cmd.impulse = 0;
@@ -483,7 +706,7 @@ static void DebugPrintTick( CTFPlayer *pBot, CTFPlayer *pOpponent, const float o
 	Msg( "[sniperbot] %s raw_pos=(%.1f,%.1f) raw_yaw=%.1f pitch=%.1f rifle=%d opp_real=(%.1f,%.1f) "
 	     "obs=[aim_err=%.1f opp_pos=(%.1f,%.1f) opp_vis=%.0f scope_act=%.0f scope_chg=%.2f "
 	     "self_ang=%.1f self_hp=%.2f self_pos=(%.1f,%.1f) t_left=%.2f] "
-	     "action=[strafe=%.2f fwd=%.2f turn=%.2f(ignored) scope=%.2f fire=%.2f]\n",
+	     "action=[strafe=%.2f%s fwd=%.2f turn=%.2f(ignored) scope=%.2f fire=%.2f]\n",
 		pBot->GetPlayerName(),
 		pBot->GetAbsOrigin().x, pBot->GetAbsOrigin().y,
 		AngleNormalize( pBot->EyeAngles().y ),
@@ -499,7 +722,11 @@ static void DebugPrintTick( CTFPlayer *pBot, CTFPlayer *pOpponent, const float o
 		obs[8],                  // self_health
 		obs[9], obs[10],         // self_pos
 		obs[11],                 // time_left
-		action[0], action[1], action[2], action[3], action[4] );
+		// the strafe actually sent to the weapon, plus a marker when the opening
+		// mirror is what flipped it -- see IsMirroringOpening
+		IsMirroringOpening() ? -action[0] : action[0],
+		IsMirroringOpening() ? "(mirrored)" : "",
+		action[1], action[2], action[3], action[4] );
 }
 
 static bool isRLBot( CTFPlayer *pPlayer )
@@ -533,13 +760,54 @@ void SniperBot_RunAll()
 	if ( !isRLBot( pBot ) )
 		return;
 
-	if ( !pBot->IsAlive() )
+	CTFPlayer *pOpponent = FindHumanOpponent( TF_TEAM_BLUE );
+
+	// Round-boundary detection for sniperbot_opening_variety. This runs BEFORE
+	// the early-outs below, and watches BOTH players, because either one alone
+	// misses half the rounds:
+	//
+	//   * the bot dying is the signal for rounds it LOSES -- but this function
+	//     used to return on !IsAlive() before ever looking at the opponent, so
+	//     those rounds registered nothing at all;
+	//   * the opponent dying is the signal for rounds it WINS -- and when the
+	//     bot loses the human never dies, so there is no transition to see.
+	//
+	// round_manager.nut force-respawns everyone on every round regardless of who
+	// died, so "either player went from dead to alive" catches every boundary.
+	bool bBotLive = pBot->IsAlive();
+	bool bOpponentLive = ( pOpponent != NULL );
+	bool bRoundStarted = ( bBotLive && !g_SniperBot.bBotWasLive )
+	                  || ( bOpponentLive && !g_SniperBot.bOpponentWasLive );
+	g_SniperBot.bBotWasLive = bBotLive;
+	g_SniperBot.bOpponentWasLive = bOpponentLive;
+
+	if ( bRoundStarted )
+	{
+		g_SniperBot.bMirrorOpening =
+			RandomFloat( 0.0f, 1.0f ) < sniperbot_opening_variety.GetFloat();
+		g_SniperBot.flOpeningEndsAt = gpGlobals->curtime + OPENING_DURATION_SECONDS;
+
+		// Re-place the bot only when a spread is actually configured. With the
+		// default of 0 this branch never runs and the round plays out exactly as
+		// it did before the option existed -- round_manager.nut's own
+		// SetAbsOrigin stands, untouched.
+		//
+		// It has to happen here rather than in PinToNamedSpawn because that only
+		// runs on bot_rl_solo; the vscript re-pins the bot to the spawn entity on
+		// every round afterwards. Running on the tick AFTER the respawn means
+		// ResetRound has already finished, so this gets the last word.
+		if ( bBotLive && sniperbot_spawn_spread.GetFloat() > 0.0f )
+		{
+			PinToNamedSpawn( pBot );
+		}
+	}
+
+	if ( !bBotLive )
 	{
 		g_SniperBot.bWasAlive = false;
 		return;
 	}
 
-	CTFPlayer *pOpponent = FindHumanOpponent( TF_TEAM_BLUE );
 	if ( !pOpponent )
 		return; // nobody on BLU yet -- wait for a human to join/respawn
 
@@ -553,6 +821,9 @@ void SniperBot_RunAll()
 		g_SniperBot.bWasAlive = true;
 		g_SniperBot.bHasHeldAction = false;
 		g_SniperBot.flNextPolicyTime = 0.0f;
+		// fresh aim state too -- a new life should not inherit the last one's
+		// steady-state offset or think it already had the target
+		g_SniperBot.bHadTargetLastTick = false;
 	}
 
 	// Re-evaluate the policy on the schedule it was trained at, and hold the
@@ -568,7 +839,8 @@ void SniperBot_RunAll()
 		// rather than running the network mean. Running the mean is what made the
 		// deployed bot hold its fire forever despite training win rates above
 		// 90%; see the comment on Forward() in tf_sniper_policy.h.
-		SniperPolicy::Forward( obs, g_SniperBot.flHeldAction, /*bStochastic=*/true );
+		SniperPolicy::Forward( obs, g_SniperBot.flHeldAction, /*bStochastic=*/true,
+		                       CurrentPolicyVariant() );
 		g_SniperBot.bHasHeldAction = true;
 		g_SniperBot.flNextPolicyTime = gpGlobals->curtime + 1.0f / POLICY_DECISIONS_PER_SECOND;
 
@@ -578,9 +850,27 @@ void SniperBot_RunAll()
 	ApplyAction( pBot, pOpponent, g_SniperBot.flHeldAction );
 }
 
+// Who may run bot_rl_solo / bot_rl_stop.
+//
+// UTIL_IsCommandIssuedByServerAdmin() assumes the listen-server host is player
+// index 1. SourceTV (tv_enable 1) joins before the host and takes index 1, which
+// pushed the host to index 2 and silently locked them out of these commands --
+// the bot just never appeared, with no message. On a listen server, accept the
+// server console or any real (non-fake) client instead; FCVAR_CHEAT already puts
+// both commands behind sv_cheats. Dedicated servers keep the stock check.
+static bool IsSniperBotCommandAllowed()
+{
+	if ( UTIL_IsCommandIssuedByServerAdmin() )
+		return true;
+	if ( engine->IsDedicatedServer() )
+		return false;
+	CBasePlayer *pIssuer = UTIL_GetCommandClient();
+	return pIssuer && !pIssuer->IsFakeClient();
+}
+
 CON_COMMAND_F( bot_rl_solo, "Spawn (or restart) the trained-policy sniper bot on RED. Join BLU as a human to fight it.", FCVAR_CHEAT )
 {
-	if ( !UTIL_IsCommandIssuedByServerAdmin() )
+	if ( !IsSniperBotCommandAllowed() )
 		return;
 
 	SniperBot_SpawnSolo();
@@ -588,7 +878,7 @@ CON_COMMAND_F( bot_rl_solo, "Spawn (or restart) the trained-policy sniper bot on
 
 CON_COMMAND_F( bot_rl_stop, "Remove the trained-policy sniper bot.", FCVAR_CHEAT )
 {
-	if ( !UTIL_IsCommandIssuedByServerAdmin() )
+	if ( !IsSniperBotCommandAllowed() )
 		return;
 
 	SniperBot_RemoveDuel();

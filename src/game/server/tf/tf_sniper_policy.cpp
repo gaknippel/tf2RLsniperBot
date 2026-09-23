@@ -44,16 +44,22 @@ namespace
 
 namespace SniperPolicy
 {
-	void Forward( const float obs[kObsSize], float action[kActionSize], bool bStochastic )
+	void Forward( const float obs[kObsSize], float action[kActionSize], bool bStochastic, int nVariant )
 	{
+		// Several policies are baked into the header (see kVariantCount) so the
+		// bot's progression can be shown off in game without reshipping a DLL.
+		// Clamped rather than asserted: a bad convar value should give a playable
+		// bot, not a crash mid-recording.
+		nVariant = clamp( nVariant, 0, kVariantCount - 1 );
+
 		float hidden0[kLayer0OutputSize];
-		LinearLayer<kLayer0OutputSize, kLayer0InputSize>( obs, kLayer0Weight, kLayer0Bias, kLayer0Tanh, hidden0 );
+		LinearLayer<kLayer0OutputSize, kLayer0InputSize>( obs, kLayer0Weight[nVariant], kLayer0Bias[nVariant], kLayer0Tanh, hidden0 );
 
 		float hidden1[kLayer1OutputSize];
-		LinearLayer<kLayer1OutputSize, kLayer1InputSize>( hidden0, kLayer1Weight, kLayer1Bias, kLayer1Tanh, hidden1 );
+		LinearLayer<kLayer1OutputSize, kLayer1InputSize>( hidden0, kLayer1Weight[nVariant], kLayer1Bias[nVariant], kLayer1Tanh, hidden1 );
 
 		float rawAction[kLayer2OutputSize];
-		LinearLayer<kLayer2OutputSize, kLayer2InputSize>( hidden1, kLayer2Weight, kLayer2Bias, kLayer2Tanh, rawAction );
+		LinearLayer<kLayer2OutputSize, kLayer2InputSize>( hidden1, kLayer2Weight[nVariant], kLayer2Bias[nVariant], kLayer2Tanh, rawAction );
 
 		// PPO's actor network outputs the MEAN of a Gaussian over actions. The
 		// policy that was actually trained -- the one the reward curves and the
@@ -75,7 +81,7 @@ namespace SniperPolicy
 			}
 			for ( int i = 0; i < kActionSize; ++i )
 			{
-				rawAction[i] += kActionStd[i] * z[i];
+				rawAction[i] += kActionStd[nVariant][i] * z[i];
 			}
 		}
 

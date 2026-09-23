@@ -27,6 +27,30 @@ SELF_SPAWN = np.array([-500.0, 0.0], dtype=np.float32)
 OPPONENT_SPAWN = np.array([500.0, 0.0], dtype=np.float32)
 SPAWN_JITTER = 40.0  # random +/- offset added to spawn position each reset
 
+# 2026-09-19: how far along the spawn wall the agent can start.
+#
+# The bot took the same line off spawn nearly every round, and the cause was not
+# a route preference -- it was that every round posed the identical question. At
+# the fixed spawn the policy's MEAN strafe is +1.16 against an action clip of
+# +1.00, i.e. saturated, so sampling noise (0.97% of draws go left) and the old
+# +/-40 jitter (mean strafe moves only to +1.01..+1.33) could not change the
+# answer. A converged policy from a fixed start gives a fixed game.
+#
+# The capability was already there and unused: measured over 250 episodes, the
+# heading it leaves spawn on has a spread of 7 degrees from the normal spawn and
+# 88 degrees from a position ~90 units away. So the threshold that matters is
+# somewhere between 40 and 90 units, and +/-40 was simply too small to cross it.
+#
+# This widens the spawn to a stretch of wall rather than a point. Each round now
+# starts from a genuinely different situation, so a position-conditional policy
+# produces a genuinely different approach -- variety that is learned and sensible
+# rather than forced on top of it.
+#
+# Must stay in sync with sniperbot_spawn_spread in tf_sniper_bot.cpp. Training
+# the policy on a spread the deployment does not reproduce is the same class of
+# sim-to-real mismatch that has cost this project several rebuilds.
+SPAWN_Y_SPREAD = 330.0
+
 # curriculum-only spawn y (see reset()) -- confirmed via direct LOS scan to
 # sit in the one horizontal gap with clear sightline the full width of the
 # arena, clear of both the crate (top at y=109) and the lower pillars
@@ -532,13 +556,27 @@ class SniperDuelEnv(gym.Env):
             spawn_y = EASY_SPAWN_Y
             y_jitter = SPAWN_JITTER * 0.25
         else:
+            # see SPAWN_Y_SPREAD -- the agent starts anywhere along its spawn
+            # wall, not on one point, so each round is a different problem
             spawn_y = 0.0  # the real RED/BLU spawn line
-            y_jitter = SPAWN_JITTER
+            y_jitter = SPAWN_Y_SPREAD
 
+        # Rejection-sample so a wide spawn can't start the agent inside cover.
+        # Falls back to the unjittered line if the arena is somehow too crowded,
+        # which keeps reset() total rather than able to fail.
         self._self_pos = np.array([SELF_SPAWN[0], spawn_y], dtype=np.float32)
-        self._self_pos[0] += self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER)
-        self._self_pos[1] += self.np_random.uniform(-y_jitter, y_jitter)
+        for _ in range(32):
+            candidate = np.array([
+                SELF_SPAWN[0] + self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER),
+                spawn_y + self.np_random.uniform(-y_jitter, y_jitter),
+            ], dtype=np.float32)
+            candidate = np.clip(candidate, POSITION_LOW, POSITION_HIGH)
+            if not self._point_in_any_barrier(candidate, padding=PLAYER_COLLISION_RADIUS):
+                self._self_pos = candidate
+                break
 
+        # The opponent keeps its own spawn line: in game the human spawns where
+        # the map puts them, and only the bot's start is ours to vary.
         self._opponent_pos = np.array([OPPONENT_SPAWN[0], spawn_y], dtype=np.float32)
         self._opponent_pos[0] += self.np_random.uniform(-SPAWN_JITTER, SPAWN_JITTER)
         self._opponent_pos[1] += self.np_random.uniform(-y_jitter, y_jitter)
@@ -617,8 +655,28 @@ class SniperDuelEnv(gym.Env):
         move = (strafe * right + fwd_back * forward) * speed
         new_pos = np.clip(pos + move, POSITION_LOW, POSITION_HIGH)
 
+        # 2026-09-16: slide along cover instead of stopping dead against it.
+        #
+        # Source resolves a blocked move by removing the component into the
+        # surface and keeping the rest, so a player pressed against a wall keeps
+        # travelling along it. This used to zero the whole move instead, which
+        # taught the policy that pushing into geometry is simply a no-op -- a
+        # free way to hold position. In game that same action slides it down the
+        # wall, which is where the observed corner-hugging came from: behaviour
+        # that costs nothing in the sim and commits it to a wall in the game.
+        #
+        # Axis-separated retry is the cheap version of the same idea. The
+        # barriers here are axis-aligned boxes, so cancelling whichever axis is
+        # blocked is exactly the surface-normal projection Source would do.
         if self._point_in_any_barrier(new_pos, padding=PLAYER_COLLISION_RADIUS):
-            new_pos = pos  # movement blocked by cover, stay put
+            slid_x = np.array([new_pos[0], pos[1]], dtype=np.float32)
+            slid_y = np.array([pos[0], new_pos[1]], dtype=np.float32)
+            if not self._point_in_any_barrier(slid_x, padding=PLAYER_COLLISION_RADIUS):
+                new_pos = slid_x
+            elif not self._point_in_any_barrier(slid_y, padding=PLAYER_COLLISION_RADIUS):
+                new_pos = slid_y
+            else:
+                new_pos = pos  # genuinely wedged (inside corner), stay put
 
         # turn_override is the analytic aim delta in degrees (see
         # AIM_SLEW_DEG_PER_STEP). The scripted opponent still steers itself via
@@ -639,6 +697,10 @@ class SniperDuelEnv(gym.Env):
         a player is only ~49 units wide, so a constant angular tolerance is a
         guaranteed miss at long range and meaninglessly loose up close.
         """
+        # 2026-09-16: reverted -- this briefly turned toward the opponent's last
+        # known position instead of holding yaw. It measured better here (faster
+        # acquisition, shorter episodes, higher win rates) and played worse in
+        # game, and it has to match tf_sniper_bot.cpp either way.
         if not has_los:
             return 0.0, 0.0
 

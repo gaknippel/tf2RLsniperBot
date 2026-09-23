@@ -33,7 +33,12 @@ namespace SniperPolicy
 	//                      never fires. Measured win rate across difficulties
 	//                      0.00/0.50/1.00 was 26.7/60.0/53.3 percent for the
 	//                      mean versus 96.7/93.3/66.7 for samples.
-	void Forward( const float obs[kObsSize], float action[kActionSize], bool bStochastic = true );
+	// nVariant picks which baked-in policy to run (see kVariantCount /
+	// kVariantNames in the generated weights header). Out-of-range values are
+	// clamped. This selects BEHAVIOUR, not difficulty -- an early checkpoint and
+	// a late one duel about equally well; what visibly differs is habits like
+	// scope discipline. Difficulty lives in the aim, see sniperbot_aim_skill.
+	void Forward( const float obs[kObsSize], float action[kActionSize], bool bStochastic = true, int nVariant = 0 );
 }
 
 #endif // TF_SNIPER_POLICY_H
