@@ -32,7 +32,7 @@
 
 
 // Half-Life User Info Configuration Layout Script (stores last settings chosen, too)
-// File generated:  Tue Sep 22 20:45:06 AM
+// File generated:  Wed Sep 23 16:53:35 AM
 //
 //
 // Cvar	-	Setting
@@ -338,7 +338,7 @@ DESCRIPTION INFO_OPTIONS
 		"#GameUI_EnableHUDMinMode"
 		"#Tooltip_EnableHUDMinMode"
 		{ BOOL }
-		{ "0" }
+		{ "1" }
 	}
 
 	"tf_colorblindassist"
