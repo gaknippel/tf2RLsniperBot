@@ -1,6 +1,13 @@
 # Ignore everything by default
 *
 !/.gitignore
+!/README.md
+!/LICENSE
+
+# showcase media linked from the README
+!/public/
+!/public/jerryWideShot.webm
+!/public/jerryWideShot.webp
 
 !/python/
 !/python/**
